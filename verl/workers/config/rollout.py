@@ -23,6 +23,8 @@ from verl.workers.config.model import MtpConfig
 
 __all__ = [
     "SamplingConfig",
+    "SummarizerConfig",
+    "MemoryGraphConfig",
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
@@ -44,6 +46,51 @@ class SamplingConfig(BaseConfig):
 
 
 @dataclass
+class SummarizerConfig(BaseConfig):
+    """OpenAI-compatible API config for single-turn tool result summarization."""
+
+    api_base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    api_model: str = "gpt-4o-mini"
+
+
+@dataclass
+class MemoryGraphConfig(BaseConfig):
+    """ECHO memory graph config (Prune to Act + Trace to Learn).
+
+    Attributes:
+        enabled:               Enable ECHO context management.
+        scorer_type:           Causal scorer type: "cross_encoder" | "api".
+        model_name:            Cross-encoder model name (cross_encoder scorer only).
+        device:                Device for cross-encoder model, e.g. "cpu" or "cuda".
+        api_base_url:          API base URL for causal scorer (api scorer only).
+        api_key:               API key for causal scorer (api scorer only).
+        api_model:             Model name for causal scorer (api scorer only).
+        top_k:                 Max parent edges per memory graph node.
+        strategy:              Causal chain tracing strategy: "greedy" | "optimal".
+        short_memory_turns:    Always retain the most recent N turns (short-term memory).
+        single_turn_max_tokens: If think + tool_result exceeds this, summarize tool_result.
+        context_max_tokens:    Trigger context management when prompt_ids exceeds this.
+                               null means use rollout.prompt_length as the threshold.
+        summarizer:            Optional LLM summarizer config; null falls back to truncation.
+    """
+
+    enabled: bool = False
+    scorer_type: str = "cross_encoder"
+    model_name: Optional[str] = None
+    device: str = "cpu"
+    api_base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    api_model: Optional[str] = None
+    top_k: int = 2
+    strategy: str = "greedy"
+    short_memory_turns: int = 1
+    single_turn_max_tokens: int = 4096
+    context_max_tokens: Optional[int] = None  # null → use rollout.prompt_length
+    summarizer: Optional[SummarizerConfig] = None
+
+
+@dataclass
 class MultiTurnConfig(BaseConfig):
     _mutable_fields = {"max_assistant_turns", "max_user_turns"}
 
@@ -59,6 +106,7 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    memory_graph: Optional[MemoryGraphConfig] = None
 
 
 @dataclass

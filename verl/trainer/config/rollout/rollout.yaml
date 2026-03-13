@@ -207,6 +207,43 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # ECHO memory graph config (Prune to Act + Trace to Learn).
+  # Set enabled: true to activate; all other fields have sensible defaults.
+  memory_graph:
+    enabled: false
+
+    # Causal scorer: "cross_encoder" (local model) | "api" (OpenAI-compatible endpoint)
+    scorer_type: cross_encoder
+    # cross_encoder scorer: model name (null uses default cross-encoder/ms-marco-MiniLM-L-6-v2)
+    model_name: null
+    device: cpu
+    # api scorer: endpoint config (only used when scorer_type: api)
+    api_base_url: null
+    api_key: null
+    api_model: null
+
+    # Max parent edges per memory graph node
+    top_k: 2
+    # Causal chain tracing strategy: "greedy" | "optimal"
+    strategy: greedy
+    # Always retain the most recent N turns (short-term memory guarantee)
+    short_memory_turns: 1
+
+    # Single-turn threshold: summarize tool_result if think + tool_result > this (tokens)
+    single_turn_max_tokens: 4096
+    # Context management threshold: trigger pruning when prompt_ids length > this (tokens).
+    # null means use rollout.prompt_length as the threshold.
+    context_max_tokens: null
+
+    # Optional LLM summarizer via OpenAI-compatible API.
+    # null (default) falls back to truncation.
+    summarizer: null
+    # To enable, replace null above with:
+    # summarizer:
+    #   api_base_url: "https://api.openai.com/v1"
+    #   api_key: "sk-..."
+    #   api_model: "gpt-4o-mini"
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

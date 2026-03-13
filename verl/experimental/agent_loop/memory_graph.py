@@ -344,17 +344,43 @@ class MemoryGraph:
 
     def get_context_turn_ids(
         self,
-        causal_max_tokens: int,
+        context_max_tokens: int,
         short_memory_turns: int = 2,
         strategy: str = "greedy",
     ) -> list[int]:
         """
-        Final set of turn_ids to retain:
-            context = causal_chain(causal_max_tokens) ∪ recent(short_memory_turns)
+        Final set of turn_ids to retain, with overlap-aware budget:
+            context = causal_chain ∪ recent(short_memory_turns)
+            total token length of union ≤ context_max_tokens
+
+        recent turns are always included first (short-term memory guarantee).
+        The causal chain is given the full context_max_tokens budget so it can
+        traverse through recent turns without penalising them twice. Only the
+        causal-only turns (not already in recent) are checked against the
+        remaining budget (context_max_tokens - recent_len). If they still
+        exceed it, they are trimmed by causal score (highest score kept first).
         """
-        causal = set(self.get_causal_chain(causal_max_tokens, strategy=strategy))
         recent = set(self.get_recent_turns(short_memory_turns))
-        return sorted(causal | recent)
+        recent_len = sum(self.nodes[i].token_len for i in recent)
+
+        # Give causal chain the full budget so recent turns inside the chain
+        # are traversed freely (no double-counting penalty).
+        causal = set(self.get_causal_chain(context_max_tokens, strategy=strategy))
+        causal_only = causal - recent
+        causal_only_len = sum(self.nodes[i].token_len for i in causal_only)
+
+        if recent_len + causal_only_len <= context_max_tokens:
+            return sorted(causal | recent)
+
+        # causal-only turns exceed remaining budget — trim by causal score
+        remaining = context_max_tokens - recent_len
+        kept: list[int] = []
+        used = 0
+        for tid in sorted(causal_only, key=lambda i: self.nodes[i].best_parent_score, reverse=True):
+            if used + self.nodes[tid].token_len <= remaining:
+                kept.append(tid)
+                used += self.nodes[tid].token_len
+        return sorted(recent | set(kept))
 
     def get_recent_turns(self, n: int) -> list[int]:
         start = max(0, len(self.nodes) - n)
