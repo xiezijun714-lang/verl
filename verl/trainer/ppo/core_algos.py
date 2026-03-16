@@ -2380,10 +2380,7 @@ def compute_policy_loss_bypass_mode(
     return pg_loss, pg_metrics
 
 
-# ---------------------------------------------------------------------------
 # ECHO: Trace to Learn — policy loss
-# ---------------------------------------------------------------------------
-
 @register_policy_loss("echo")
 def compute_policy_loss_echo(
     old_log_prob: torch.Tensor,
@@ -2431,32 +2428,17 @@ def compute_policy_loss_echo(
         rollout_is_weights: Optional pre-computed rollout IS correction weights.
         response_turn_ids: Per-token turn IDs, shape ``(bs, response_length)``.
             Built by :func:`build_token_turn_ids`; padding positions are ``-1``.
-            When ``None``, falls back to pure REINFORCE.
+            Must not be ``None`` — ECHO loss requires turn structure for turn-level clip.
 
     Returns:
         Tuple of ``(scalar_loss, metrics_dict)``.
     """
     assert config is not None
     assert isinstance(config, ActorConfig)
-
-    if response_turn_ids is None:
-        # Fallback: no turn structure → pure REINFORCE (no clipping).
-        pg_losses = -log_prob * advantages
-        if rollout_is_weights is not None:
-            pg_losses = pg_losses * rollout_is_weights
-        pg_loss = agg_loss(
-            loss_mat=pg_losses,
-            loss_mask=response_mask,
-            loss_agg_mode=loss_agg_mode,
-            **config.global_batch_info,
-        )
-        ppo_kl = verl_F.masked_mean(old_log_prob - log_prob, response_mask)
-        return pg_loss, {
-            "actor/pg_clipfrac": 0.0,
-            "actor/ppo_kl": ppo_kl.detach().item(),
-            "actor/pg_clipfrac_lower": 0.0,
-            "echo/mean_credit_weighted_adv": verl_F.masked_mean(advantages, response_mask).detach().item(),
-        }
+    assert response_turn_ids is not None, (
+        "compute_policy_loss_echo requires response_turn_ids (per-token turn IDs). "
+        "Got None — check that expand_sub_trajectories populated response_turn_ids correctly."
+    )
 
     # --- Turn-level geometric mean IS ratio ---
     log_ratio = log_prob - old_log_prob  # (bs, response_length)
@@ -2507,22 +2489,20 @@ def compute_policy_loss_echo(
 
     # --- Metrics ---
     with torch.no_grad():
-        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+        clipped = torch.gt(pg_losses2, pg_losses1)
+        pg_clipfrac = verl_F.masked_mean((clipped & (advantages > 0)).float(), response_mask)
+        pg_clipfrac_lower = verl_F.masked_mean((clipped & (advantages < 0)).float(), response_mask)
         ppo_kl = verl_F.masked_mean(-log_ratio, response_mask)
         mean_adv = verl_F.masked_mean(advantages, response_mask)
 
     return pg_loss, {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
-        "actor/pg_clipfrac_lower": torch.tensor(0.0).item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "echo/mean_credit_weighted_adv": mean_adv.detach().item(),
     }
 
-
-# ---------------------------------------------------------------------------
 # ECHO: Trace to Learn — causal credit assignment
-# ---------------------------------------------------------------------------
-
 def _compute_turn_credit(adjacency: dict) -> list[float]:
     """Reverse credit propagation from the last turn through the causal graph.
 

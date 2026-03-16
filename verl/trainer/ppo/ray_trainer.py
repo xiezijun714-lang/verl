@@ -130,162 +130,175 @@ def compute_response_mask(data: DataProto):
 # ECHO: Trace to Learn — orchestration wrappers (pure algo in core_algos.py)
 # ---------------------------------------------------------------------------
 
-def apply_causal_credit(batch: DataProto) -> DataProto:
-    """Apply Trace to Learn causal credit weights to advantages (main-traj entries).
-
-    Also builds a ``response_turn_ids`` batch tensor (per-token turn assignment)
-    required by :func:`core_algos.compute_policy_loss_echo` for turn-level IS ratio.
-
-    Delegates pure computation to :func:`core_algos.apply_echo_credit`.
-    Only modifies samples that have ``memory_graph_adjacency`` and ``turn_ids``
-    in ``non_tensor_batch``; all others are left unchanged.
-    """
-    if "memory_graph_adjacency" not in batch.non_tensor_batch:
-        return batch
-    if "turn_ids" not in batch.non_tensor_batch:
-        return batch
-
-    advantages = batch.batch["advantages"].clone()  # [B, response_length]
-    response_length = advantages.shape[1]
-    adjacency_all = batch.non_tensor_batch["memory_graph_adjacency"]
-    turn_ids_all = batch.non_tensor_batch["turn_ids"]
-
-    # Build per-token turn id matrix (B, response_length); default -1 = no turn.
-    rtt = torch.full((len(adjacency_all), response_length), -1, dtype=torch.long)
-
-    for i, (adjacency, turn_ids) in enumerate(zip(adjacency_all, turn_ids_all)):
-        if not adjacency or not turn_ids:
-            continue
-        advantages[i], per_token = core_algos.apply_echo_credit(
-            advantages[i], adjacency, turn_ids
-        )
-        rtt[i] = torch.tensor(per_token, dtype=torch.long)
-
-    batch.batch["advantages"] = advantages
-    batch.batch["response_turn_ids"] = rtt
-    return batch
-
-
 def expand_sub_trajectories(
     batch: DataProto,
     prompt_length: int,
     response_length: int,
     pad_token_id: int = 0,
 ) -> DataProto:
-    """Expand ECHO completed_sub_trajectories into the training batch.
+    """Expand ECHO completed_sub_trajectories into the final actor-training batch.
 
-    For each sample with completed sub-trajectories (captured during rollout when context
-    management triggers), creates additional DataProto entries so each sub-trajectory is
-    trained with the exact context used at inference time — preserving the on-policy
-    guarantee even after prompt_ids compression (Prune to Act).
+    Implements the following invariant:
 
-    The scalar advantage from the main trajectory is broadcast uniformly to all response
-    tokens of each sub-trajectory. This is exact for outcome-based estimators (GRPO,
-    REINFORCE++) where all tokens in a sample already share the same advantage value.
+    * **Unsplit sample** (no context management triggered): the main trajectory IS the
+      only sub-trajectory.  Causal credit weighting is applied to its advantages inline,
+      and the entry is kept in the output batch.
+    * **Split sample** (context management triggered at least once): the main-trajectory
+      entry is DROPPED.  Only the completed sub-trajectories — each independently
+      credit-weighted — are added to the output batch.
 
-    Critic update is intentionally NOT run on sub-trajectory entries; they are appended
-    only for the actor update that follows.
+    This guarantees that the final batch contains exactly one entry per sub-trajectory,
+    all consistently credit-weighted, regardless of whether splitting occurred.
+
+    Critic update is intentionally NOT run on sub-trajectory entries; this function
+    must be called AFTER the critic update.
 
     Args:
-        batch:           Training batch *after* compute_advantage() has been called.
-        prompt_length:   Fixed prompt tensor width (tokens) used in the main batch.
-        response_length: Fixed response tensor width (tokens) used in the main batch.
+        batch:           Training batch *after* ``compute_advantage()`` has been called.
+        prompt_length:   Fixed prompt tensor width (tokens).
+        response_length: Fixed response tensor width (tokens).
         pad_token_id:    Token id used for prompt left-padding.
 
     Returns:
-        DataProto with sub-trajectory entries appended, or ``batch`` unchanged when no
-        sample has completed sub-trajectories.
+        DataProto containing the final sub-trajectory batch, or ``batch`` unchanged
+        when ``memory_graph_adjacency`` data is absent.
     """
     if "completed_sub_trajectories" not in batch.non_tensor_batch:
         return batch
 
     completed_sub_trajs_all = batch.non_tensor_batch["completed_sub_trajectories"]
-    if not any(st for st in completed_sub_trajs_all):
-        return batch
-
-    adv_tensor = batch.batch["advantages"]      # [B, response_length]
-    resp_mask_t = batch.batch["response_mask"]  # [B, response_length]
-    has_ref = "ref_log_prob" in batch.batch.keys()
     adjacency_all = batch.non_tensor_batch.get("memory_graph_adjacency", [None] * len(completed_sub_trajs_all))
+    turn_ids_all = batch.non_tensor_batch.get("turn_ids", [None] * len(completed_sub_trajs_all))
 
+    resp_mask_t = batch.batch["response_mask"]   # [B, response_length]
+    has_ref = "ref_log_prob" in batch.batch.keys()
+
+    # Clone advantages so we can apply credit weighting to unsplit entries in-place
+    # without touching the original tensor before we call select_idxs.
+    advantages = batch.batch["advantages"].clone()   # [B, response_length]
+    rtt = torch.full(advantages.shape, -1, dtype=torch.long, device=advantages.device) # response_turn_ids
+
+    unsplit_indices: list[int] = []
     new_entries: list[DataProto] = []
 
     for i, sub_trajs in enumerate(completed_sub_trajs_all):
-        if not sub_trajs:
-            continue
-
-        # Scalar advantage for this sample.
-        # For outcome estimators (GRPO/REINFORCE++) all valid response tokens already
-        # share the same value, so the mean is exact.
-        valid = resp_mask_t[i].bool()
-        adv_scalar = float(adv_tensor[i][valid].mean()) if valid.any() else 0.0
-
         adjacency = adjacency_all[i] if i < len(adjacency_all) else None
+        turn_ids = list(turn_ids_all[i]) if (i < len(turn_ids_all) and turn_ids_all[i] is not None) else None
 
-        for sub_traj in sub_trajs:
-            p_ids: list[int] = sub_traj["prompt_ids"]
-            r_ids: list[int] = sub_traj["response_ids"]
-            r_mask: list[int] = sub_traj["response_mask"]
-            r_logprobs: list[float] = sub_traj.get("response_logprobs", [0.0] * len(r_ids))
-            sub_turn_ids: list[int] = sub_traj.get("response_turn_ids", [])
-
-            # --- prompt: left-pad to prompt_length ---
-            p_len = len(p_ids)
-            if p_len >= prompt_length:
-                p_ids = p_ids[-prompt_length:]
-                prompt_pad = 0
-            else:
-                prompt_pad = prompt_length - p_len
-                p_ids = [pad_token_id] * prompt_pad + p_ids
-
-            # --- response: right-pad / truncate to response_length ---
-            r_real = min(len(r_ids), response_length)
-            r_ids = (r_ids + [pad_token_id] * response_length)[:response_length]
-            r_mask = (r_mask + [0] * response_length)[:response_length]
-            r_logprobs = (r_logprobs + [0.0] * response_length)[:response_length]
-
-            # --- attention_mask ---
-            attn = [0] * prompt_pad + [1] * (prompt_length - prompt_pad) + \
-                   [1] * r_real + [0] * (response_length - r_real)
-
-            # --- position_ids: cumulative position of real tokens ---
-            pos, position_ids = 0, []
-            for a in attn:
-                position_ids.append(pos if a else 0)
-                pos += a
-
-            # --- advantages + per-token turn IDs (turn-level causal credit) ---
-            if adjacency and sub_turn_ids:
-                advantages, per_token_turn_ids = core_algos.prepare_sub_traj_echo_tensors(
-                    adv_scalar, r_mask, sub_turn_ids, adjacency, response_length
+        if not sub_trajs:
+            # ── Unsplit: main traj IS the sub-traj ──────────────────────────────
+            # Keep this entry; apply credit weighting to its advantages.
+            unsplit_indices.append(i)
+            if adjacency and turn_ids:
+                advantages[i], per_token = core_algos.apply_echo_credit(
+                    advantages[i], adjacency, turn_ids
                 )
-            else:
-                advantages = [adv_scalar * float(m) for m in r_mask]
-                per_token_turn_ids = None
+                rtt[i] = torch.tensor(per_token, dtype=torch.long, device=advantages.device)
 
-            tensors: dict[str, torch.Tensor] = {
-                "input_ids":    torch.tensor([p_ids + r_ids], dtype=torch.long),
-                "responses":    torch.tensor([r_ids],         dtype=torch.long),
-                "response_mask": torch.tensor([r_mask],       dtype=torch.long),
-                "attention_mask": torch.tensor([attn],        dtype=torch.long),
-                "position_ids": torch.tensor([position_ids],  dtype=torch.long),
-                "old_log_probs": torch.tensor([r_logprobs],   dtype=torch.float32),
-                "advantages":   torch.tensor([advantages],    dtype=torch.float32),
-            }
-            if per_token_turn_ids is not None:
-                tensors["response_turn_ids"] = torch.tensor([per_token_turn_ids], dtype=torch.long)
-            if has_ref:
-                # Reference policy was not run for sub-trajectories.
-                # Use zeros → no KL penalty on sub-traj tokens (conservative approximation).
-                tensors["ref_log_prob"] = torch.zeros(1, response_length, dtype=torch.float32)
+        else:
+            # ── Split: drop main traj, expand completed sub-trajs ───────────────
+            # adv_scalar is derived from raw GRPO advantages (advantages[i] has not
+            # been modified above since we only write to unsplit entries).
+            valid = resp_mask_t[i].bool()
+            adv_scalar = float(advantages[i][valid].mean()) if valid.any() else 0.0
 
-            entry = DataProto.from_dict(tensors=tensors, meta_info=batch.meta_info)
-            new_entries.append(entry)
+            for sub_traj in sub_trajs:
+                p_ids: list[int] = sub_traj["prompt_ids"]
+                r_ids: list[int] = sub_traj["response_ids"]
+                r_mask: list[int] = sub_traj["response_mask"]
+                r_logprobs: list[float] = sub_traj.get("response_logprobs", [0.0] * len(r_ids))
+                sub_turn_ids: list[int] = sub_traj.get("response_turn_ids", [])
 
-    if not new_entries:
+                # --- prompt: left-pad to prompt_length ---
+                p_len = len(p_ids)
+                if p_len >= prompt_length:
+                    p_ids = p_ids[-prompt_length:]
+                    prompt_pad = 0
+                else:
+                    prompt_pad = prompt_length - p_len
+                    p_ids = [pad_token_id] * prompt_pad + p_ids
+
+                # --- response: right-pad / truncate to response_length ---
+                r_real = min(len(r_ids), response_length)
+                r_ids = (r_ids + [pad_token_id] * response_length)[:response_length]
+                r_mask = (r_mask + [0] * response_length)[:response_length]
+                r_logprobs = (r_logprobs + [0.0] * response_length)[:response_length]
+
+                # --- attention_mask ---
+                attn = [0] * prompt_pad + [1] * (prompt_length - prompt_pad) + \
+                       [1] * r_real + [0] * (response_length - r_real)
+
+                # --- position_ids: cumulative position of real tokens ---
+                pos, position_ids = 0, []
+                for a in attn:
+                    position_ids.append(pos if a else 0)
+                    pos += a
+
+                # --- advantages + per-token turn IDs (turn-level causal credit) ---
+                if adjacency and sub_turn_ids:
+                    sub_adv, per_token_turn_ids = core_algos.prepare_sub_traj_echo_tensors(
+                        adv_scalar, r_mask, sub_turn_ids, adjacency, response_length
+                    )
+                else:
+                    sub_adv = [adv_scalar * float(m) for m in r_mask]
+                    per_token_turn_ids = None
+
+                tensors: dict[str, torch.Tensor] = {
+                    "input_ids":      torch.tensor([p_ids + r_ids], dtype=torch.long),
+                    "responses":      torch.tensor([r_ids],          dtype=torch.long),
+                    "response_mask":  torch.tensor([r_mask],         dtype=torch.long),
+                    "attention_mask": torch.tensor([attn],           dtype=torch.long),
+                    "position_ids":   torch.tensor([position_ids],   dtype=torch.long),
+                    "old_log_probs":  torch.tensor([r_logprobs],     dtype=torch.float32),
+                    "advantages":     torch.tensor([sub_adv],        dtype=torch.float32),
+                }
+                # Always include response_turn_ids so all entries share the same key set.
+                # -1 means "no turn structure" and is handled gracefully by the echo loss.
+                if per_token_turn_ids is not None:
+                    tensors["response_turn_ids"] = torch.tensor([per_token_turn_ids], dtype=torch.long)
+                else:
+                    tensors["response_turn_ids"] = torch.full((1, response_length), -1, dtype=torch.long)
+                if has_ref:
+                    # Reference policy was not run for sub-trajectories.
+                    # Use zeros → no KL penalty on sub-traj tokens (conservative approximation).
+                    tensors["ref_log_prob"] = torch.zeros(1, response_length, dtype=torch.float32)
+
+                entry = DataProto.from_dict(tensors=tensors, meta_info=batch.meta_info)
+                new_entries.append(entry)
+
+    # Nothing to do (no memory-graph data populated for any sample).
+    if not unsplit_indices and not new_entries:
         return batch
 
-    return DataProto.concat([batch] + new_entries)
+    all_parts: list[DataProto] = []
+    if unsplit_indices:
+        # Write credit-weighted advantages and turn IDs back before slicing.
+        batch.batch["advantages"] = advantages
+        batch.batch["response_turn_ids"] = rtt
+        all_parts.append(batch.select_idxs(unsplit_indices))
+    all_parts.extend(new_entries)
+
+    if len(all_parts) == 1:
+        return all_parts[0]
+
+    # Align tensor keys to the intersection so DataProto.concat doesn't KeyError.
+    # Unsplit entries carry all original batch keys (returns, values, …); sub-traj
+    # entries only carry actor-relevant keys.  Taking the intersection retains
+    # exactly what the actor needs and drops critic-only keys.
+    common_tensor_keys = set(all_parts[0].batch.keys())
+    for part in all_parts[1:]:
+        common_tensor_keys &= set(part.batch.keys())
+
+    # Non-tensor batch: new_entries have empty non_tensor_batch; intersection is {}.
+    common_non_tensor_keys = set(all_parts[0].non_tensor_batch.keys())
+    for part in all_parts[1:]:
+        common_non_tensor_keys &= set(part.non_tensor_batch.keys())
+
+    aligned = [
+        p.select(batch_keys=list(common_tensor_keys), non_tensor_batch_keys=list(common_non_tensor_keys))
+        for p in all_parts
+    ]
+    return DataProto.concat(aligned)
 
 
 def compute_advantage(
@@ -1665,10 +1678,6 @@ class RayPPOTrainer:
                             self.config.actor_rollout_ref.rollout.multi_turn, "memory_graph", None
                         )
                         if _memory_graph_cfg is not None and _memory_graph_cfg.enabled:
-                            # Apply causal credit to main-trajectory advantages first,
-                            # then expand completed sub-trajectories (they carry their
-                            # own per-turn credit computed during expand_sub_trajectories).
-                            batch = apply_causal_credit(batch)
                             batch = expand_sub_trajectories(
                                 batch,
                                 prompt_length=self.config.actor_rollout_ref.rollout.prompt_length,

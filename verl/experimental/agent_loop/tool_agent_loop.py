@@ -571,19 +571,6 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
 
-        # Create memory graph node for this turn (assistant think + interaction response)
-        if agent_data.memory_graph is not None:
-            node = agent_data.memory_graph.add_node(
-                think_text=agent_data._pending_think_text,
-                tool_result_text=interaction_responses if isinstance(interaction_responses, str) else str(interaction_responses),
-                think_token_len=agent_data._pending_think_token_len,
-                tool_result_token_len=len(response_ids),
-            )
-            agent_data.turn_ids.append(node.turn_id)
-            agent_data.turn_token_ids.append(
-                agent_data._current_turn_think_tokens + list(response_ids)
-            )
-
         # Check termination condition
         if should_terminate_sequence:
             return AgentState.TERMINATED
