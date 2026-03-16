@@ -18,7 +18,15 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = [
+    "register_adv_est",
+    "get_adv_estimator_fn",
+    "AdvantageEstimator",
+    # ECHO: Trace to Learn
+    "compute_policy_loss_echo",
+    "apply_echo_credit",
+    "prepare_sub_traj_echo_tensors",
+]
 
 from collections import defaultdict
 from enum import Enum
@@ -2370,3 +2378,274 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# ---------------------------------------------------------------------------
+# ECHO: Trace to Learn — policy loss
+# ---------------------------------------------------------------------------
+
+@register_policy_loss("echo")
+def compute_policy_loss_echo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    response_turn_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """ECHO Trace to Learn policy loss with turn-level IS ratio and PPO clip.
+
+    Aligns clip granularity with reward granularity (both turn-level):
+
+    * Per-turn IS ratio = geometric mean of per-token ratios within the turn::
+
+        r_t = exp( mean_{i ∈ turn_t}( log π_new(i) - log π_old(i) ) )
+
+    * PPO clip applied at turn level — all tokens in a turn share the same
+      clip decision.
+
+    The stop-gradient trick from GSPO is used so that gradients flow through
+    each token's ``log_prob`` independently, while the clip threshold is
+    determined by the turn-level ratio (preventing double-counting)::
+
+        log_r_eff[i] = log_prob[i] - sg(log_prob[i]) + sg(mean_log_ratio_turn[t])
+
+    ``advantages`` are pre-scaled by per-turn causal credit weights
+    (:func:`apply_causal_credit_to_advantages`) before this function is called;
+    all tokens within a turn therefore share the same advantage scalar.
+
+    When ``response_turn_ids`` is ``None`` (no turn structure available, e.g.
+    padding samples), the function falls back to pure REINFORCE without clipping.
+
+    Args:
+        old_log_prob: Old-policy log-probs, shape ``(bs, response_length)``.
+        log_prob: Current-policy log-probs, shape ``(bs, response_length)``.
+        advantages: Credit-weighted advantages, shape ``(bs, response_length)``.
+        response_mask: Valid-token mask, shape ``(bs, response_length)``.
+        loss_agg_mode: Aggregation mode.  ``"seq-mean-token-mean"`` is recommended
+            to prevent long sub-trajectories from dominating the gradient.
+        config: :class:`ActorConfig` with ``clip_ratio``, ``clip_ratio_low``,
+            ``clip_ratio_high``, and ``global_batch_info``.
+        rollout_is_weights: Optional pre-computed rollout IS correction weights.
+        response_turn_ids: Per-token turn IDs, shape ``(bs, response_length)``.
+            Built by :func:`build_token_turn_ids`; padding positions are ``-1``.
+            When ``None``, falls back to pure REINFORCE.
+
+    Returns:
+        Tuple of ``(scalar_loss, metrics_dict)``.
+    """
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    if response_turn_ids is None:
+        # Fallback: no turn structure → pure REINFORCE (no clipping).
+        pg_losses = -log_prob * advantages
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
+        pg_loss = agg_loss(
+            loss_mat=pg_losses,
+            loss_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            **config.global_batch_info,
+        )
+        ppo_kl = verl_F.masked_mean(old_log_prob - log_prob, response_mask)
+        return pg_loss, {
+            "actor/pg_clipfrac": 0.0,
+            "actor/ppo_kl": ppo_kl.detach().item(),
+            "actor/pg_clipfrac_lower": 0.0,
+            "echo/mean_credit_weighted_adv": verl_F.masked_mean(advantages, response_mask).detach().item(),
+        }
+
+    # --- Turn-level geometric mean IS ratio ---
+    log_ratio = log_prob - old_log_prob  # (bs, response_length)
+    bs, resp_len = log_ratio.shape
+
+    # Valid turn IDs start from 0; -1 marks padding — clamp to 0 for scatter ops
+    # (padding positions are excluded by response_mask, so their contribution is 0).
+    turn_ids_safe = response_turn_ids.clamp(min=0).long()  # (bs, response_length)
+    max_turns = int(turn_ids_safe[response_mask.bool()].max().item()) + 1 if response_mask.any() else 1
+
+    # Sum log_ratio per turn: shape (bs, max_turns)
+    turn_log_ratio_sum = torch.zeros(bs, max_turns, device=log_ratio.device, dtype=log_ratio.dtype)
+    turn_log_ratio_sum.scatter_add_(1, turn_ids_safe, log_ratio * response_mask)
+
+    # Count valid tokens per turn: shape (bs, max_turns)
+    turn_token_count = torch.zeros(bs, max_turns, device=log_ratio.device, dtype=log_ratio.dtype)
+    turn_token_count.scatter_add_(1, turn_ids_safe, response_mask.float())
+
+    # Geometric mean log ratio per turn: (bs, max_turns)
+    turn_geomean_log_ratio = turn_log_ratio_sum / turn_token_count.clamp(min=1)
+
+    # Broadcast back to token level: each token gets its turn's geometric mean
+    turn_geomean_per_token = turn_geomean_log_ratio.gather(1, turn_ids_safe)  # (bs, response_length)
+
+    # Stop-gradient trick (following GSPO): gradient flows through log_prob[i]
+    # independently; clip threshold is determined by the turn-level ratio.
+    log_turn_ratio = log_prob - log_prob.detach() + turn_geomean_per_token.detach()
+    log_turn_ratio = log_turn_ratio.clamp(max=10.0)
+    turn_ratio = log_turn_ratio.exp()  # constant within each turn
+
+    # --- PPO clip at turn level ---
+    clip_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    pg_losses1 = -advantages * turn_ratio
+    pg_losses2 = -advantages * torch.clamp(turn_ratio, 1 - clip_low, 1 + clip_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **config.global_batch_info,
+    )
+
+    # --- Metrics ---
+    with torch.no_grad():
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+        ppo_kl = verl_F.masked_mean(-log_ratio, response_mask)
+        mean_adv = verl_F.masked_mean(advantages, response_mask)
+
+    return pg_loss, {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": torch.tensor(0.0).item(),
+        "echo/mean_credit_weighted_adv": mean_adv.detach().item(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ECHO: Trace to Learn — causal credit assignment
+# ---------------------------------------------------------------------------
+
+def _compute_turn_credit(adjacency: dict) -> list[float]:
+    """Reverse credit propagation from the last turn through the causal graph.
+
+    The last turn is seeded with credit = 1.0; credit flows backward through
+    parent edges: ``credit[parent] += credit[child] * edge_score``.
+    Result is normalised so the most causally important turn = 1.0.
+    """
+    num_turns = adjacency.get("num_turns", 0)
+    if num_turns == 0:
+        return []
+
+    parents: dict = adjacency.get("parents", {})
+    credit = [0.0] * num_turns
+    credit[num_turns - 1] = 1.0
+
+    for j in range(num_turns - 1, -1, -1):
+        if credit[j] == 0.0:
+            continue
+        for i_str, score in parents.get(str(j), {}).items():
+            credit[int(i_str)] += credit[j] * float(score)
+
+    max_c = max(credit) if credit else 1.0
+    if max_c > 0.0:
+        credit = [c / max_c for c in credit]
+    return credit
+
+
+def _build_token_credit_weights(
+    turn_ids: list[int],
+    credit: list[float],
+    adjacency: dict,
+    response_length: int,
+) -> list[float]:
+    """Map per-turn credit scores to a per-token weight vector (length == response_length).
+
+    All tokens within a turn share the turn's credit weight.
+    Right-padded with 1.0 (neutral) if shorter than response_length.
+    """
+    think_lens: dict = adjacency.get("think_token_lens", {})
+    tool_lens: dict = adjacency.get("tool_result_token_lens", {})
+
+    weights: list[float] = []
+    for tid in turn_ids:
+        t_len = think_lens.get(str(tid), 0) + tool_lens.get(str(tid), 0)
+        w = credit[tid] if tid < len(credit) else 1.0
+        weights.extend([w] * t_len)
+
+    if len(weights) < response_length:
+        weights.extend([1.0] * (response_length - len(weights)))
+    return weights[:response_length]
+
+
+def _build_token_turn_ids(
+    turn_ids: list[int],
+    adjacency: dict,
+    response_length: int,
+) -> list[int]:
+    """Map each response token position to its global turn ID (-1 for padding)."""
+    think_lens: dict = adjacency.get("think_token_lens", {})
+    tool_lens: dict = adjacency.get("tool_result_token_lens", {})
+
+    token_turn_ids: list[int] = []
+    for tid in turn_ids:
+        t_len = think_lens.get(str(tid), 0) + tool_lens.get(str(tid), 0)
+        token_turn_ids.extend([tid] * t_len)
+
+    if len(token_turn_ids) < response_length:
+        token_turn_ids.extend([-1] * (response_length - len(token_turn_ids)))
+    return token_turn_ids[:response_length]
+
+
+def apply_echo_credit(
+    advantages: torch.Tensor,
+    adjacency: dict,
+    turn_ids: list[int],
+) -> tuple[torch.Tensor, list[int]]:
+    """Apply causal credit weights to advantages and return per-token turn IDs.
+
+    Used by ``apply_causal_credit`` in ray_trainer to process **main-trajectory**
+    entries.  Combines the two operations into one call so no helper is exposed.
+
+    Args:
+        advantages: 1-D float tensor of length ``response_length``.
+        adjacency: dict from ``MemoryGraph.get_adjacency()``.
+        turn_ids: Ordered list of turn IDs in this trajectory's response.
+
+    Returns:
+        ``(credit_weighted_advantages, per_token_turn_ids)`` where
+        ``per_token_turn_ids`` is a list of length ``response_length`` mapping
+        each token to its global turn ID (``-1`` for padding).
+    """
+    response_length = advantages.shape[0]
+    credit = _compute_turn_credit(adjacency)
+    weights = _build_token_credit_weights(turn_ids, credit, adjacency, response_length)
+    weight_tensor = torch.tensor(weights, dtype=advantages.dtype, device=advantages.device)
+    token_turn_ids = _build_token_turn_ids(turn_ids, adjacency, response_length)
+    return advantages * weight_tensor, token_turn_ids
+
+
+def prepare_sub_traj_echo_tensors(
+    adv_scalar: float,
+    r_mask: list[int],
+    turn_ids: list[int],
+    adjacency: dict,
+    response_length: int,
+) -> tuple[list[float], list[int]]:
+    """Build credit-weighted advantages and per-token turn IDs for a **sub-trajectory**.
+
+    Used by ``expand_sub_trajectories`` in ray_trainer.  Collapses three separate
+    helper calls into one so no private helper is exposed.
+
+    Args:
+        adv_scalar: Scalar advantage for this sub-trajectory (e.g. mean of valid tokens).
+        r_mask: Response mask list of length ``response_length`` (1 = valid, 0 = pad).
+        turn_ids: Ordered list of turn IDs in this sub-trajectory's response.
+        adjacency: dict from ``MemoryGraph.get_adjacency()``.
+        response_length: Padded response length.
+
+    Returns:
+        ``(advantages, per_token_turn_ids)`` — both lists of length ``response_length``.
+    """
+    credit = _compute_turn_credit(adjacency)
+    weights = _build_token_credit_weights(turn_ids, credit, adjacency, response_length)
+    advantages = [adv_scalar * weights[k] * float(r_mask[k]) for k in range(response_length)]
+    token_turn_ids = _build_token_turn_ids(turn_ids, adjacency, response_length)
+    return advantages, token_turn_ids
