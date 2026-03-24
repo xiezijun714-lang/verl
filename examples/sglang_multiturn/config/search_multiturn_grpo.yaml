@@ -13,6 +13,7 @@ data:
   return_raw_chat: True
   shuffle: False
 
+
 actor_rollout_ref:
   hybrid_engine: True
   rollout:
@@ -20,4 +21,4 @@ actor_rollout_ref:
     multi_turn:
       enable: True
       max_assistant_turns: 2
-      format: qwen
+      format: hermes

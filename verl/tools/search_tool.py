@@ -79,7 +79,7 @@ class SearchExecutionWorker:
 
     def _init_rate_limit(self, rate_limit):
         """Initialize singleton rate limiter."""
-        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True, lifetime="detached").remote(rate_limit)
 
     def ping(self):
         """Health check method."""
@@ -107,7 +107,12 @@ def init_search_execution_pool(
     if mode == PoolMode.ThreadMode:
         return (
             ray.remote(SearchExecutionWorker)
-            .options(max_concurrency=num_workers)
+            .options(
+                max_concurrency=num_workers,
+                name="search-execution-pool",
+                get_if_exists=True,
+                lifetime="detached",
+            )
             .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
         )
     else:

@@ -88,7 +88,10 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
 @ray.remote
 def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple[str, str]:
-    addr = ray.util.get_node_ip_address().strip("[]")
+    # Allow override via env var. Default to 127.0.0.1 for single-node to avoid
+    # K8s sidecar proxy (Istio/Envoy) intercepting intra-pod TCP and corrupting
+    # the torch.distributed TCPStore nonce handshake.
+    addr = os.environ.get("VERL_MASTER_ADDR", "127.0.0.1") or ray.util.get_node_ip_address().strip("[]")
 
     if master_port_range is None:
         with socket.socket() as s:
