@@ -757,6 +757,8 @@ class RayPPOTrainer:
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
+        if OmegaConf.select(self.config.trainer, "master_port_range") is not None:
+            wg_kwargs["master_port_range"] = OmegaConf.to_container(self.config.trainer.master_port_range)
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
