@@ -9,9 +9,12 @@ source /root/paddlejob/workspace/xzj/venv_verl/bin/activate
 
 # Propagate wandb API key to Ray workers
 export WANDB_API_KEY="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"
-export WANDB_ENTITY="515718106-pku"  
+export WANDB_ENTITY="515718106-pku"
+export DASHSCOPE_API_KEY="sk-e82fc87192af4171a33600b42da55efc"  
 
 # Bypass proxy for localhost (http_proxy env var would break curl health check)
+export http_proxy="http://agent.baidu.com:8188"
+export https_proxy="http://agent.baidu.com:8188"
 export no_proxy="127.0.0.1,localhost"
 export NO_PROXY="127.0.0.1,localhost"
 
@@ -64,7 +67,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.max_prompt_length=2048 \
-    data.max_response_length=8192 \
+    data.max_response_length=4096 \
     data.filter_overlong_prompts=False \
     data.truncation='left' \
     data.return_raw_chat=True \
@@ -81,15 +84,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
-    actor_rollout_ref.rollout.n=4 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.multi_stage_wake_up=True \
     actor_rollout_ref.rollout.multi_turn.enable=true \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 \
