@@ -1103,8 +1103,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        # perform recompute log_prob
-        calculate_entropy = not is_lora
+        # perform recompute log_prob — skip entropy when entropy_coeff=0 to avoid OOM
+        entropy_coeff = self.config.actor.entropy_coeff
+        calculate_entropy = (not is_lora) and (entropy_coeff != 0.0)
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)

@@ -1,25 +1,8 @@
-import json
 import logging
-import os
 import re
 import string
-from urllib import request, error
 
 logger = logging.getLogger(__name__)
-
-DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-JUDGE_MODEL = "qwen-turbo"  # 便宜快速，够用于判断语义等价
-JUDGE_TIMEOUT = 15  # seconds
-
-JUDGE_PROMPT = """\
-You are a strict answer equivalence judge.
-Determine whether the predicted answer is semantically equivalent to the expected answer.
-They may differ in formatting, punctuation, articles (a/an/the), abbreviations, or minor wording, but must refer to the same entity/concept.
-
-Expected answer: {expected}
-Predicted answer: {predicted}
-
-Reply with ONLY one word: "YES" or "NO"."""
 
 
 def _normalize(text: str) -> str:
@@ -31,74 +14,81 @@ def _normalize(text: str) -> str:
     return text
 
 
-def _llm_judge(predicted: str, expected: str) -> float:
-    """Call DashScope API to judge semantic equivalence. Returns 1.0 / 0.0 / -1.0 (error)."""
-    if not DASHSCOPE_API_KEY:
-        return -1.0
+def _extract_finish_answer(solution_str: str) -> str | None:
+    """Extract answer from finish tool call JSON."""
+    pattern = r'"name"\s*:\s*"finish".*?"answer"\s*:\s*"(.*?)"(?:\s*[,}\]])'
+    matches = re.findall(pattern, solution_str, re.DOTALL)
+    if matches:
+        return matches[-1].strip()
+    return None
 
-    payload = json.dumps({
-        "model": JUDGE_MODEL,
-        "messages": [
-            {"role": "user", "content": JUDGE_PROMPT.format(expected=expected, predicted=predicted)}
-        ],
-        "max_tokens": 8,
-        "temperature": 0.0,
-    }).encode("utf-8")
 
-    req = request.Request(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-        },
-        method="POST",
-    )
+def _count_tool_calls(solution_str: str) -> dict:
+    """Count different tool calls and extract search queries."""
+    n_search = len(re.findall(r'"name"\s*:\s*"search"', solution_str))
+    n_open_page = len(re.findall(r'"name"\s*:\s*"open_page"', solution_str))
+    n_finish = len(re.findall(r'"name"\s*:\s*"finish"', solution_str))
 
-    try:
-        proxy_url = os.environ.get("https_proxy") or os.environ.get("http_proxy", "")
-        if proxy_url:
-            proxy_handler = request.ProxyHandler({"https": proxy_url, "http": proxy_url})
-            opener = request.build_opener(proxy_handler)
-        else:
-            opener = request.build_opener()
-        with opener.open(req, timeout=JUDGE_TIMEOUT) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            answer = result["choices"][0]["message"]["content"].strip().upper()
-            if "YES" in answer:
-                return 1.0
-            return 0.0
-    except Exception as e:
-        logger.warning(f"LLM judge failed: {e}")
-        return -1.0
+    # Extract search queries from query_list
+    queries = re.findall(r'"query_list"\s*:\s*\["([^"]+)"\]', solution_str)
+
+    return {
+        "n_search": n_search,
+        "n_open_page": n_open_page,
+        "n_finish": n_finish,
+        "queries": queries,
+    }
+
+
+def _process_reward(solution_str: str) -> float:
+    """Compute process reward based on behavioral signals.
+
+    Rewards:
+        +0.2  called finish (anti token-waste)
+        +0.2  no repeated search queries (anti death-loop)
+        +0.1  used open_page (encourage verification)
+        Max process total: 0.5  (must stay below outcome reward 1.0)
+    """
+    reward = 0.0
+    tools = _count_tool_calls(solution_str)
+
+    # Called finish: +0.2
+    if tools["n_finish"] > 0:
+        reward += 0.2
+
+    # No repeated queries: +0.2
+    queries = tools["queries"]
+    if queries and len(queries) == len(set(queries)):
+        reward += 0.2
+
+    # Used open_page: +0.1
+    if tools["n_open_page"] > 0:
+        reward += 0.1
+
+    return reward
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
-    matches = re.findall(r"<answer>(.*?)</answer>", solution_str, re.DOTALL)
-    if not matches:
-        return 0.0
+    # Process reward (always computed, provides cold-start signal)
+    process = _process_reward(solution_str)
 
-    predicted = matches[-1].strip()
-    expected = str(ground_truth).strip()
+    # Outcome reward (binary, 0 or 1.0)
+    outcome = 0.0
+    predicted = _extract_finish_answer(solution_str)
+    if predicted:
+        expected = str(ground_truth).strip()
+        if predicted.lower() == expected.lower():
+            outcome = 1.0
+        elif _normalize(predicted) == _normalize(expected):
+            outcome = 1.0
+        else:
+            norm_pred = _normalize(predicted)
+            norm_exp = _normalize(expected)
+            if norm_exp and norm_pred:
+                if norm_exp in norm_pred or norm_pred in norm_exp:
+                    outcome = 1.0
 
-    # 1) Exact match (case-insensitive) — fast path, no API call
-    if predicted.lower() == expected.lower():
-        return 1.0
-
-    # 2) Normalized match (remove articles, punctuation, extra whitespace)
-    if _normalize(predicted) == _normalize(expected):
-        return 1.0
-
-    # 3) LLM judge for semantic equivalence
-    llm_result = _llm_judge(predicted, expected)
-    if llm_result >= 0:
-        return llm_result
-
-    # 4) Fallback: rule-based (only if API failed)
-    norm_pred = _normalize(predicted)
-    norm_exp = _normalize(expected)
-    if norm_exp and norm_pred:
-        if norm_exp in norm_pred or norm_pred in norm_exp:
-            return 0.5
-
-    return 0.0
+    return {
+        "score": process + outcome,  # training reward (process + outcome)
+        "acc": outcome,              # pure accuracy (0 or 1) for validation
+    }

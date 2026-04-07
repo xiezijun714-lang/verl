@@ -57,7 +57,7 @@ def call_search_api(
     request_id = str(uuid.uuid4())
     log_prefix = f"[Search Request ID: {request_id}] "
 
-    payload = {"queries": query_list, "topk": topk, "return_scores": return_scores}
+    payload = {"queries": [str(q) for q in query_list], "topk": int(topk), "return_scores": return_scores}
 
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
@@ -127,14 +127,38 @@ def call_search_api(
     return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
 
 
-def _passages2string(retrieval_result):
-    """Convert retrieval results to formatted string."""
+def _truncate_to_tokens(text: str, max_tokens: int, tokenizer=None) -> str:
+    """Truncate text to approximately max_tokens tokens.
+
+    Uses a simple word-based approximation (1 token ≈ 0.75 words for English)
+    when no tokenizer is provided, to avoid heavy dependencies.
+    """
+    # Fast approximation: ~4 chars per token for English text
+    char_limit = max_tokens * 4
+    if len(text) <= char_limit:
+        return text
+    return text[:char_limit] + "..."
+
+
+def _passages2string(retrieval_result, max_tokens_per_doc: int = 512):
+    """Convert retrieval results to formatted string.
+
+    Each document is truncated to *max_tokens_per_doc* tokens so that
+    the search tool returns concise snippets.  Use the ``open_page``
+    tool to read the full document.
+    """
     format_reference = ""
     for idx, doc_item in enumerate(retrieval_result):
         content = doc_item["document"]["contents"]
         title = content.split("\n")[0]
         text = "\n".join(content.split("\n")[1:])
-        format_reference += f"Doc {idx + 1} (Title: {title})\n{text}\n\n"
+        text = _truncate_to_tokens(text, max_tokens_per_doc)
+        # Include docid so the model can call open_page later
+        docid = doc_item.get("docid", "")
+        if docid:
+            format_reference += f"Doc {idx + 1} (Title: {title}) [docid: {docid}]\n{text}\n\n"
+        else:
+            format_reference += f"Doc {idx + 1} (Title: {title})\n{text}\n\n"
     return format_reference.strip()
 
 

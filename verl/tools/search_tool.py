@@ -252,10 +252,16 @@ class SearchTool(BaseTool):
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
 
+        # Limit to max_queries_per_call to control context budget
+        max_q = self.config.get("max_queries_per_call", 1)
+        if len(query_list_from_params) > max_q:
+            query_list_from_params = query_list_from_params[:max_q]
+
         # Execute search using Ray execution pool
         try:
+            effective_topk = parameters.get("topk", self.topk)
             result_text, metadata = await self.execution_pool.execute.remote(
-                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout
+                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, effective_topk, timeout
             )
 
             # Store results in instance dictionary

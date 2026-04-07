@@ -1,16 +1,18 @@
 tools:
   - class_name: "verl.tools.search_tool.SearchTool"
     config:
-      retrieval_service_url: "http://127.0.0.1:8000/retrieve"
+      retrieval_service_url: "http://10.63.234.28:8000/retrieve"
+      topk: 3
+      max_queries_per_call: 1
       num_workers: 16
       rate_limit: 40
-      timeout: 60
+      timeout: 300
       type: native
     tool_schema:
       type: "function"
       function:
         name: "search"
-        description: "Search for information using a list of queries. Returns relevant documents for each query."
+        description: "Performs a search over the BrowseComp-Plus corpus. Supply a 'query' string and optional 'topk' (default 5). Returns top-k document snippets (truncated to ~512 tokens each) with their docid. Use open_page to read a full document."
         parameters:
           type: "object"
           properties:
@@ -18,6 +20,53 @@ tools:
               type: "array"
               items:
                 type: "string"
-              description: "A list of fully-formed semantic queries. The tool will return search results for each query."
+              maxItems: 1
+              description: "A list containing a single search query."
+            topk:
+              type: "integer"
+              description: "Return the top k pages (default 5)."
           required:
             - "query_list"
+
+  - class_name: "verl.tools.open_page_tool.OpenPageTool"
+    config:
+      retrieval_service_url: "http://10.63.234.28:8000/get_doc_chunks"
+      topk_chunks: 3
+      chunk_size: 512
+      chunk_overlap: 32
+      timeout: 30
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "open_page"
+        description: "Retrieve the most relevant passages from a specific document. Provide the docid from prior search results and a query describing what information you need. Returns the top matching chunks instead of the full document."
+        parameters:
+          type: "object"
+          properties:
+            docid:
+              type: "string"
+              description: "Document ID from search results, e.g. the value shown in [docid: xxx]."
+            query:
+              type: "string"
+              description: "The question or keywords to search for within this document."
+          required:
+            - "docid"
+            - "query"
+
+  - class_name: "verl.tools.finish_tool.FinishTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "finish"
+        description: "Submit your final answer. Call this when you have a definitive answer or cannot progress further."
+        parameters:
+          type: "object"
+          properties:
+            answer:
+              type: "string"
+              description: "Your final answer. Be concise and precise."
+          required:
+            - "answer"

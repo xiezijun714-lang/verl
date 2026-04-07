@@ -33,13 +33,25 @@ from sglang.srt.entrypoints.http_server import (
     set_global_state,
 )
 from sglang.srt.managers.io_struct import (
-    ContinueGenerationReqInput,
     GenerateReqInput,
-    PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus
+try:
+    from sglang.srt.managers.io_struct import (
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
+    )
+    _has_pause_resume = True
+except ImportError:
+    _has_pause_resume = False
+try:
+    from sglang.srt.managers.tokenizer_manager import ServerStatus
+except ImportError:
+    import enum
+    class ServerStatus(enum.Enum):
+        Up = "up"
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
@@ -196,7 +208,6 @@ class SGLangHttpServer:
             "mm_attention_backend": "fa3",
             "attention_backend": attention_backend if attention_backend is not None else "fa3",
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
-            "skip_server_warmup": True,
             "quantization": quantization,
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
             if quantization == "fp8"
@@ -252,7 +263,10 @@ class SGLangHttpServer:
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-        server_args = ServerArgs(**args)
+        server_args = ServerArgs(**{
+            k: v for k, v in args.items()
+            if k in [f.name for f in dataclasses.fields(ServerArgs)]
+        })
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
@@ -286,9 +300,11 @@ class SGLangHttpServer:
         # Manually add Prometheus middleware before starting server
         # This ensures /metrics endpoint is available immediately
         if server_args.enable_metrics:
-            from sglang.srt.utils.common import add_prometheus_middleware
-
-            add_prometheus_middleware(app)
+            try:
+                from sglang.srt.utils.common import add_prometheus_middleware
+                add_prometheus_middleware(app)
+            except ImportError:
+                pass  # sglang < 0.5.0: no prometheus middleware helper
 
         self._server_port, self._server_task = await run_uvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
@@ -422,10 +438,13 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
-        await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+        if _has_pause_resume:
+            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+        # sglang < 0.5.0: no pause/resume API, weights update is synchronous
 
     async def resume_generation(self):
-        await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+        if _has_pause_resume:
+            await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):
         if (

@@ -217,33 +217,6 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
-        # On the last allowed turn, inject a hint BEFORE generation so the model
-        # knows it must produce a final text answer instead of another tool call.
-        is_last_turn = (
-            self.max_assistant_turns
-            and agent_data.assistant_turns >= self.max_assistant_turns - 1
-        )
-        if is_last_turn:
-            hint = [
-                {
-                    "role": "user",
-                    "content": (
-                        "You have used all your search attempts. "
-                        "Based on the information you have gathered, provide your final answer now. "
-                        "You must use the format: <answer>your answer</answer>"
-                    ),
-                }
-            ]
-            agent_data.messages.extend(hint)
-            hint_ids = await self.apply_chat_template(
-                hint, remove_system_prompt=True
-            )
-            agent_data.prompt_ids += hint_ids
-            agent_data.response_mask += [0] * len(hint_ids)
-            if agent_data.response_logprobs:
-                agent_data.response_logprobs += [0.0] * len(hint_ids)
-            agent_data.user_turns += 1
-
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -279,6 +252,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
@@ -409,6 +384,10 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
+
+        # Terminate if any tool is a stop/finish tool
+        if any(name.lower() in ("finish", "stop", "submit") for name in tool_call_names):
+            return AgentState.TERMINATED
         return AgentState.GENERATING
 
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:

@@ -30,7 +30,11 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+try:
+    from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+    _has_weight_sync = True
+except ImportError:
+    _has_weight_sync = False
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_valid_ipv6_address
@@ -210,13 +214,25 @@ class ServerAdapter(BaseRollout):
         else:
             weights = weights
 
-        async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-            await sgl_update_weights(
-                engine=self._engine,
-                params_batch=params_batch,
-                device_mesh_key="infer_tp",
-                device_mesh=self.device_mesh,
-            )
+        if _has_weight_sync:
+            async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                await sgl_update_weights(
+                    engine=self._engine,
+                    params_batch=params_batch,
+                    device_mesh_key="infer_tp",
+                    device_mesh=self.device_mesh,
+                )
+        else:
+            # Fallback for sglang < 0.5.0 (no weight_sync module)
+            # Use Ray remote call to bypass HTTP overhead (base64 + HTTP POST)
+            from sglang.srt.utils import MultiprocessingSerializer
+            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                    batch_list = list(params_batch)
+                    serialized = [
+                        MultiprocessingSerializer.serialize(batch_list) for _ in range(self.device_mesh["infer_tp"].size())
+                    ]
+                    await self.server_actor.update_weights_direct.remote(serialized)
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()

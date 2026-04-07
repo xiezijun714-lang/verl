@@ -888,7 +888,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
         with adapter_ctx:
-            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+            calculate_entropy = data.meta_info.pop("calculate_entropy", not is_lora)
+            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
         tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
         if not is_lora:
             tensors["entropys"] = entropys
