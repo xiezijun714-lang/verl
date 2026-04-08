@@ -45,8 +45,8 @@ def _process_reward(solution_str: str) -> float:
 
     Rewards:
         +0.2  called finish (anti token-waste)
-        +0.2  no repeated search queries (anti death-loop)
-        +0.1  used open_page (encourage verification)
+        +0.1  no repeated search queries (anti death-loop)
+        +0.2  used open_page (encourage verification)
         Max process total: 0.5  (must stay below outcome reward 1.0)
     """
     reward = 0.0
