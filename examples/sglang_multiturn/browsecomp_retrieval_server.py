@@ -44,6 +44,41 @@ def extract_title(text: str, url: str = "") -> str:
     return "Unknown"
 
 
+def build_corpus_from_file(corpus_file: str):
+    """Load corpus from an official BC-Plus parquet file (HuggingFace format).
+
+    Expected columns: docid (str), text (str), url (str).
+    Download from: https://huggingface.co/datasets/Tevatron/browsecomp-plus-corpus
+    """
+    print(f"Loading corpus from file: {corpus_file} ...", flush=True)
+    if corpus_file.endswith(".jsonl"):
+        import json
+        docs = []
+        with open(corpus_file, "r") as f:
+            for line in f:
+                doc = json.loads(line.strip())
+                if doc.get("docid") and doc.get("text"):
+                    docs.append(doc)
+    else:
+        df = pd.read_parquet(corpus_file)
+        docs = []
+        for _, row in df.iterrows():
+            docid = str(row.get("docid", ""))
+            text = str(row.get("text", ""))
+            url = str(row.get("url", ""))
+            if docid and text:
+                docs.append({"docid": docid, "text": text, "url": url})
+
+    # Deduplicate by docid
+    seen = {}
+    for doc in docs:
+        docid = doc["docid"]
+        if docid not in seen:
+            seen[docid] = doc
+    print(f"  Loaded {len(seen)} unique documents from file.", flush=True)
+    return seen
+
+
 def build_corpus(data_dir: str):
     print("Loading parquet files ...", flush=True)
     dfs = []
@@ -84,7 +119,8 @@ def _tokenize(text: str) -> List[str]:
 
 
 class BM25Retriever:
-    def __init__(self, data_dir: str, cache_path: str = "/root/paddlejob/workspace/xzj/browsecomp_bm25_cache.pkl"):
+    def __init__(self, data_dir: str, cache_path: str = "/root/paddlejob/workspace/xzj/browsecomp_bm25_cache.pkl",
+                 corpus_file: str = None):
         from rank_bm25 import BM25Okapi
 
         if cache_path and os.path.exists(cache_path):
@@ -97,7 +133,7 @@ class BM25Retriever:
             self.contents = cached["contents"]
             print(f"  Loaded {len(self.docids)} documents from cache.", flush=True)
         else:
-            doc_map = build_corpus(data_dir)
+            doc_map = build_corpus_from_file(corpus_file) if corpus_file else build_corpus(data_dir)
             self.docids = list(doc_map.keys())
             self.docs = [doc_map[d] for d in self.docids]
 
@@ -149,6 +185,7 @@ class DenseRetriever:
         cache_path: str = "/root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache.pkl",
         batch_size: int = 4,
         max_doc_length: int = 8192,
+        corpus_file: str = None,
     ):
         self._device_str = device          # lazy: don't create torch.device yet
         self._model_name = model_name
@@ -220,7 +257,7 @@ class DenseRetriever:
             # Use larger batch size with multi-GPU
             self._init_batch_size = batch_size * n_gpus
 
-            doc_map = build_corpus(data_dir)
+            doc_map = build_corpus_from_file(corpus_file) if corpus_file else build_corpus(data_dir)
             self.docids = list(doc_map.keys())
             docs = [doc_map[d] for d in self.docids]
 
@@ -313,7 +350,7 @@ class DenseRetriever:
         import torch.nn.functional as F
 
         if instruction:
-            texts = [f"Instruct: {instruction}\nQuery: {t}" for t in texts]
+            texts = [f"Instruct: {instruction}\n<|embed|>\n{t}" for t in texts]
 
         self._ensure_model_on_gpu()
         all_embs = []
@@ -350,8 +387,8 @@ class DenseRetriever:
     def search(self, query: str, topk: int = 3) -> List[dict]:
         query_emb = self._encode(
             [query],
-            instruction="Given a web search query, retrieve relevant passages that answer the query",
-            max_length=256,
+            instruction="Given a question, retrieve relevant passages that help answer the question",
+            max_length=512,
         )  # (1, D)
         scores, indices = self.index.search(query_emb, topk)
         results = []
@@ -367,7 +404,7 @@ class DenseRetriever:
 
     def embed(self, texts: List[str], instruction: str = "") -> np.ndarray:
         """Public method used by /embed endpoint (for reward semantic judge)."""
-        return self._encode(texts, instruction=instruction or None, max_length=256)
+        return self._encode(texts, instruction=instruction or None, max_length=512)
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +642,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["bm25", "dense"], default="bm25")
     parser.add_argument("--data_dir", default="/root/paddlejob/workspace/xzj/dataset/browsecomp-plus-processed")
+    parser.add_argument("--corpus_file", default=None,
+                        help="Path to official BC-Plus corpus file (parquet/jsonl). "
+                             "If set, overrides --data_dir. Download from: "
+                             "https://huggingface.co/datasets/Tevatron/browsecomp-plus-corpus")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     # BM25 options
@@ -618,7 +659,7 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "bm25":
-        retriever = BM25Retriever(args.data_dir, cache_path=args.bm25_cache)
+        retriever = BM25Retriever(args.data_dir, cache_path=args.bm25_cache, corpus_file=args.corpus_file)
         _bm25_cache_path = args.bm25_cache
         print(f"Starting process pool with {args.pool_workers} workers ...", flush=True)
         search_pool = ProcessPoolExecutor(
@@ -642,6 +683,7 @@ def main():
             device=args.device,
             cache_path=args.dense_cache,
             batch_size=args.batch_size,
+            corpus_file=args.corpus_file,
         )
         # No process pool for dense mode
 

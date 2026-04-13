@@ -3,23 +3,20 @@ Offline script: encode all BrowseComp-Plus documents with Qwen3-Embedding and bu
 Run this ONCE before starting the dense retrieval server.
 
 Usage:
-    cd /root/paddlejob/workspace/xzj/verl
-    source /root/paddlejob/workspace/xzj/venv_verl/bin/activate
+    cd /root/paddlejob/workspace/env_run/xzj/echo
+    source /root/paddlejob/workspace/env_run/xzj/venv_echo_megatron/bin/activate
 
-    # Step 1 (if needed): install faiss
-    pip install faiss-gpu   # recommended (GPU accelerated)
-    # or: pip install faiss-cpu
-
-    # Step 2: build index
+    # Build with official corpus (recommended)
     python examples/sglang_multiturn/build_embed_index.py \
-        --data_dir /root/paddlejob/workspace/xzj/dataset/browsecomp-plus-processed \
-        --model Qwen/Qwen3-Embedding \
-        --device cuda:7 \
-        --batch_size 256 \
-        --output /tmp/browsecomp_dense_cache.pkl
+        --corpus_file /root/paddlejob/workspace/env_run/xzj/dataset/browsecomp-plus-processed/corpus.parquet \
+        --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B \
+        --device cuda:0 \
+        --batch_size 128 \
+        --max_doc_length 8192 \
+        --output /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl
 
-Expected runtime: ~10-20 min for 67K docs on A100
-Output file size: ~1 GB (67K * 4096 dim * 4 bytes)
+Expected runtime: ~20-40 min for 100K docs on A100
+Output file size: ~1.6 GB (100K * 4096 dim * 4 bytes)
 """
 
 import argparse
@@ -30,6 +27,21 @@ import sys
 
 import numpy as np
 import pandas as pd
+
+
+def build_corpus_from_file(corpus_file: str) -> dict:
+    """Load corpus from official BC-Plus parquet file (HuggingFace format)."""
+    print(f"Loading corpus from file: {corpus_file} ...", flush=True)
+    df = pd.read_parquet(corpus_file)
+    seen = {}
+    for _, row in df.iterrows():
+        docid = str(row.get("docid", ""))
+        text = str(row.get("text", ""))
+        url = str(row.get("url", ""))
+        if docid and text:
+            seen[docid] = {"docid": docid, "text": text, "url": url}
+    print(f"  Loaded {len(seen)} unique documents from file.", flush=True)
+    return seen
 
 
 def build_corpus(data_dir: str) -> dict:
@@ -107,11 +119,13 @@ def encode_all(texts, tokenizer, model, device, batch_size, max_length):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="/root/paddlejob/workspace/xzj/dataset/browsecomp-plus-processed")
-    parser.add_argument("--model", default="Qwen/Qwen3-Embedding")
-    parser.add_argument("--device", default="cuda:7")
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--max_doc_length", type=int, default=512)
-    parser.add_argument("--output", default="/tmp/browsecomp_dense_cache.pkl")
+    parser.add_argument("--corpus_file", default=None,
+                        help="Path to official BC-Plus corpus parquet. If set, overrides --data_dir.")
+    parser.add_argument("--model", default="/root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_doc_length", type=int, default=4096)
+    parser.add_argument("--output", default="/root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl")
     args = parser.parse_args()
 
     # Check faiss
@@ -127,7 +141,7 @@ def main():
     from transformers import AutoTokenizer, AutoModel
 
     # Build corpus
-    doc_map = build_corpus(args.data_dir)
+    doc_map = build_corpus_from_file(args.corpus_file) if args.corpus_file else build_corpus(args.data_dir)
     docids = list(doc_map.keys())
     docs = [doc_map[d] for d in docids]
 

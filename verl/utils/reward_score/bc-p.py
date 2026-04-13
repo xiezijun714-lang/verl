@@ -14,28 +14,28 @@ def _normalize(text: str) -> str:
     return text
 
 
-def _extract_finish_answer(solution_str: str) -> str | None:
-    """Extract answer from finish tool call JSON."""
-    pattern = r'"name"\s*:\s*"finish".*?"answer"\s*:\s*"(.*?)"(?:\s*[,}\]])'
+def _extract_answer(solution_str: str) -> str | None:
+    """Extract answer from 'Exact Answer:' text output (official BC-Plus format)."""
+    pattern = r"Exact Answer\s*:\s*(.+)"
     matches = re.findall(pattern, solution_str, re.DOTALL)
     if matches:
-        return matches[-1].strip()
+        # Take the first match; strip trailing whitespace/newlines
+        answer = matches[0].strip()
+        # Truncate at newline to avoid capturing subsequent sections
+        answer = answer.split("\n")[0].strip()
+        return answer
     return None
 
 
 def _count_tool_calls(solution_str: str) -> dict:
-    """Count different tool calls and extract search queries."""
+    """Count search tool calls and extract search queries."""
     n_search = len(re.findall(r'"name"\s*:\s*"search"', solution_str))
-    n_open_page = len(re.findall(r'"name"\s*:\s*"open_page"', solution_str))
-    n_finish = len(re.findall(r'"name"\s*:\s*"finish"', solution_str))
 
-    # Extract search queries from query_list
-    queries = re.findall(r'"query_list"\s*:\s*\["([^"]+)"\]', solution_str)
+    # Extract search queries from query parameter (single string)
+    queries = re.findall(r'"query"\s*:\s*"([^"]+)"', solution_str)
 
     return {
         "n_search": n_search,
-        "n_open_page": n_open_page,
-        "n_finish": n_finish,
         "queries": queries,
     }
 
@@ -44,25 +44,30 @@ def _process_reward(solution_str: str) -> float:
     """Compute process reward based on behavioral signals.
 
     Rewards:
-        +0.2  called finish (anti token-waste)
+        +0.2  produced Exact Answer format (anti token-waste / structured output)
         +0.1  no repeated search queries (anti death-loop)
-        +0.2  used open_page (encourage verification)
+        +0.1  called search at least once (anti direct-guess)
+        +0.1  called search at least 2 times with distinct queries (encourage exploration)
         Max process total: 0.5  (must stay below outcome reward 1.0)
     """
     reward = 0.0
     tools = _count_tool_calls(solution_str)
 
-    # Called finish: +0.2
-    if tools["n_finish"] > 0:
+    # Produced Exact Answer: +0.2
+    if _extract_answer(solution_str) is not None:
         reward += 0.2
 
-    # No repeated queries: +0.2
+    # Called search at least once: +0.1
+    if tools["n_search"] > 0:
+        reward += 0.1
+
+    # No repeated queries: +0.1
     queries = tools["queries"]
     if queries and len(queries) == len(set(queries)):
-        reward += 0.2
+        reward += 0.1
 
-    # Used open_page: +0.1
-    if tools["n_open_page"] > 0:
+    # At least 2 distinct search queries: +0.1
+    if queries and len(set(queries)) >= 2:
         reward += 0.1
 
     return reward
@@ -74,7 +79,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
 
     # Outcome reward (binary, 0 or 1.0)
     outcome = 0.0
-    predicted = _extract_finish_answer(solution_str)
+    predicted = _extract_answer(solution_str)
     if predicted:
         expected = str(ground_truth).strip()
         if predicted.lower() == expected.lower():

@@ -150,13 +150,12 @@ class SearchTool(BaseTool):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query_list": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of search queries"
+                            "query": {
+                                "type": "string",
+                                "description": "The search query string."
                             }
                         },
-                        "required": ["query_list"]
+                        "required": ["query"]
                     }
                 }
             }
@@ -208,12 +207,12 @@ class SearchTool(BaseTool):
         }
         return instance_id, ToolResponse()
 
-    def execute_search(self, instance_id: str, query_list: list, retrieval_service_url: str, topk: int, timeout: int):
+    def execute_search(self, instance_id: str, query: str, retrieval_service_url: str, topk: int, timeout: int):
         """Execute search operation using retrieval service.
 
         Args:
             instance_id: Tool instance ID
-            query_list: List of search queries
+            query: Search query string
             retrieval_service_url: URL of the retrieval service
             topk: Number of top results to return
             timeout: Request timeout in seconds
@@ -223,7 +222,7 @@ class SearchTool(BaseTool):
         """
         result_text, metadata = perform_single_search_batch(
             retrieval_service_url=retrieval_service_url,
-            query_list=query_list,
+            query_list=[query],
             topk=topk,
             concurrent_semaphore=None,  # Ray handles concurrency control
             timeout=timeout,
@@ -237,7 +236,7 @@ class SearchTool(BaseTool):
 
         Args:
             instance_id: The instance ID of the tool
-            parameters: Tool parameters containing query_list and optional timeout
+            parameters: Tool parameters containing query and optional timeout
 
         Returns: tool_response, tool_reward_score, tool_metrics
             tool_response: The response str of the tool.
@@ -245,23 +244,18 @@ class SearchTool(BaseTool):
             tool_metrics: The metrics of the tool.
         """
         timeout = self.timeout
-        query_list_from_params = parameters.get("query_list")
+        query_from_params = parameters.get("query")
 
-        if not query_list_from_params or not isinstance(query_list_from_params, list):
-            error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
+        if not query_from_params or not isinstance(query_from_params, str):
+            error_msg = "Error: 'query' is missing, empty, or not a string in parameters."
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
-
-        # Limit to max_queries_per_call to control context budget
-        max_q = self.config.get("max_queries_per_call", 1)
-        if len(query_list_from_params) > max_q:
-            query_list_from_params = query_list_from_params[:max_q]
 
         # Execute search using Ray execution pool
         try:
             effective_topk = parameters.get("topk", self.topk)
             result_text, metadata = await self.execution_pool.execute.remote(
-                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, effective_topk, timeout
+                self.execute_search, instance_id, query_from_params, self.retrieval_service_url, effective_topk, timeout
             )
 
             # Store results in instance dictionary

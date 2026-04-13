@@ -49,8 +49,9 @@ export NO_PROXY="$NO_PROXY_LIST"
 # Required for Megatron
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTHONUNBUFFERED=1
+# Fix Ray OpenTelemetry segfault (getenv in grpc_core::GetEnv)
+export RAY_enable_open_telemetry=0
 
-PROJECT_DIR="$(pwd)"
 MODEL_PATH="/root/paddlejob/workspace/env_run/xzj/models/Qwen3-32B"
 DATA_DIR="/root/paddlejob/workspace/env_run/xzj/dataset/browsecomp-plus-processed"
 
@@ -59,8 +60,8 @@ TRAIN_BATCH_SIZE=32
 N_RESP=8
 
 # ---- Parallelism ----
-# Qwen3-8B: 36 layers, 32 heads, hidden=4096
-# Training: TP=2, PP=1, CP=4 → 2×1×4=8 GPUs per model replica, DP=32/8=4
+# Qwen3-32B: 64 layers, 40 KV heads, hidden=5120
+# Training: TP=8, PP=1, CP=4 → 8×1×4=32 GPUs per model replica, DP=32/32=1
 ACTOR_TP=8
 ACTOR_PP=1
 ACTOR_VPP=null
@@ -76,8 +77,8 @@ ROLLOUT_TP=8
 
 # ---- Sequence lengths ----
 MAX_PROMPT_LENGTH=2048
-MAX_RESPONSE_LENGTH=10240
-MAX_MODEL_LEN=12300
+MAX_RESPONSE_LENGTH=8192
+MAX_MODEL_LEN=10240
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 
 # ---- Ray cluster ----
@@ -96,7 +97,7 @@ ray start --head \
 
 for ip in $WORKER_IPS; do
     echo "[ray] Starting worker on $ip ..."
-    ssh "$ip" "export LD_LIBRARY_PATH='${VENV_PATH}/lib/python3.10/site-packages/nvidia/cudnn/lib:\$LD_LIBRARY_PATH' && source ${VENV_PATH}/bin/activate && ray start --address='${HEAD_IP}:6379' --num-gpus=8"
+    ssh "$ip" "export LD_LIBRARY_PATH='${VENV_PATH}/lib/python3.10/site-packages/nvidia/cudnn/lib:\$LD_LIBRARY_PATH' && export RAY_enable_open_telemetry=0 && source ${VENV_PATH}/bin/activate && ray start --address='${HEAD_IP}:6379' --num-gpus=8"
 done
 
 echo "[ray] Waiting for ${NNODES} nodes ..."
@@ -115,16 +116,19 @@ done
 echo "[retriever] Killing any existing process on port 8000 ..."
 fuser -k 8000/tcp 2>/dev/null || true
 sleep 1
+# Extra cleanup: kill any process still listening on port 8000
+kill $(ss -tlnp 'sport = :8000' | grep -oP 'pid=\K\d+') 2>/dev/null || true
+sleep 1
 
 setsid "${VENV_PATH}/bin/python3" \
     "$PROJECT_DIR/examples/sglang_multiturn/browsecomp_retrieval_server.py" \
     --mode dense \
     --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B \
     --device cpu \
-    --data_dir "$DATA_DIR" \
+    --corpus_file "${DATA_DIR}/corpus.parquet" \
     --host 0.0.0.0 --port 8000 \
     --batch_size 4 \
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache.pkl \
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl \
     > ${LOG_DIR}/browsecomp_retriever.log 2>&1 &
 RETRIEVER_PID=$!
 
@@ -153,10 +157,10 @@ RETRIEVER_CMD=("${VENV_PATH}/bin/python3"
     --mode dense
     --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B
     --device cpu
-    --data_dir "$DATA_DIR"
+    --corpus_file "${DATA_DIR}/corpus.parquet"
     --host 0.0.0.0 --port 8000
     --batch_size 4
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache.pkl)
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl)
 
 (
     while true; do
@@ -247,7 +251,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=${NNODES} \
     trainer.project_name='echo' \
-    trainer.experiment_name='qwen3-8b_bcp_megatron-10k-vanilla' \
+    trainer.experiment_name='qwen3-32b_bcp_megatron-10k-vanilla' \
     trainer.logger='["console", "wandb"]' \
     trainer.save_freq=-1 \
     trainer.test_freq=2 \

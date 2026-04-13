@@ -85,10 +85,10 @@ setsid "${VENV_PATH}/bin/python3" \
     --mode dense \
     --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B \
     --device cpu \
-    --data_dir "$DATA_DIR" \
+    --corpus_file "${DATA_DIR}/corpus.parquet" \
     --host 0.0.0.0 --port 8000 \
     --batch_size 4 \
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache.pkl \
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl \
     > "${LOG_DIR}/browsecomp_retriever.log" 2>&1 &
 RETRIEVER_PID=$!
 
@@ -117,10 +117,10 @@ RETRIEVER_CMD=("${VENV_PATH}/bin/python3"
     --mode dense
     --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B
     --device cpu
-    --data_dir "$DATA_DIR"
+    --corpus_file "${DATA_DIR}/corpus.parquet"
     --host 0.0.0.0 --port 8000
     --batch_size 4
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache.pkl")
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl")
 
 (
     while true; do
@@ -153,7 +153,7 @@ echo "[watchdog] Started retrieval server watchdog (PID=$WATCHDOG_PID)"
 # ---- 训练 ----
 python3 -m verl.trainer.main_ppo \
     --config-path="$PROJECT_DIR/examples/sglang_multiturn/config" \
-    --config-name='search_multiturn_grpo' \
+    --config-name='bcp_multiturn_fsdp_grpo' \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.max_prompt_length=2048 \
