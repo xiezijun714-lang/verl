@@ -74,9 +74,6 @@ def _process_reward(solution_str: str) -> float:
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
-    # Process reward (always computed, provides cold-start signal)
-    process = _process_reward(solution_str)
-
     # Outcome reward (binary, 0 or 1.0)
     outcome = 0.0
     predicted = _extract_answer(solution_str)
@@ -94,6 +91,6 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
                     outcome = 1.0
 
     return {
-        "score": process + outcome,  # training reward (process + outcome)
-        "acc": outcome,              # pure accuracy (0 or 1) for validation
+        "score": outcome,   # pure outcome reward
+        "acc": outcome,    # pure accuracy (0 or 1) for validation
     }

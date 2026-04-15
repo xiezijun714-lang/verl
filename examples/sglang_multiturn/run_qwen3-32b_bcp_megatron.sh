@@ -63,14 +63,14 @@ N_RESP=8
 # Qwen3-32B: 64 layers, 40 KV heads, hidden=5120
 # Training: TP=8, PP=1, CP=4 → 8×1×4=32 GPUs per model replica, DP=32/32=1
 ACTOR_TP=8
-ACTOR_PP=1
+ACTOR_PP=4
 ACTOR_VPP=null
-ACTOR_CP=4       # Context parallelism for 64K sequences
+ACTOR_CP=1       # Context parallelism for 64K sequences
 
 REF_TP=8
-REF_PP=1
+REF_PP=4
 REF_VPP=null
-REF_CP=4
+REF_CP=1
 
 # Inference: TP=8, 4 replicas (1 per DP rank)
 ROLLOUT_TP=8
@@ -128,7 +128,7 @@ setsid "${VENV_PATH}/bin/python3" \
     --corpus_file "${DATA_DIR}/corpus.parquet" \
     --host 0.0.0.0 --port 8000 \
     --batch_size 4 \
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl \
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_tevatron.pkl \
     > ${LOG_DIR}/browsecomp_retriever.log 2>&1 &
 RETRIEVER_PID=$!
 
@@ -160,7 +160,7 @@ RETRIEVER_CMD=("${VENV_PATH}/bin/python3"
     --corpus_file "${DATA_DIR}/corpus.parquet"
     --host 0.0.0.0 --port 8000
     --batch_size 4
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_official.pkl)
+    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_tevatron.pkl)
 
 (
     while true; do
@@ -229,7 +229,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${TOKEN_BUDGET} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP} \
     actor_rollout_ref.rollout.n=${N_RESP} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.15 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.2 \
     actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN} \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.context_length=${MAX_MODEL_LEN} \
     actor_rollout_ref.rollout.free_cache_engine=True \
