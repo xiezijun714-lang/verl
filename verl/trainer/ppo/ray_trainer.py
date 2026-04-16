@@ -562,7 +562,15 @@ class RayPPOTrainer:
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            # SUPO: output size differs from input, don't use input's pad_size
+            adv_estimator = self.config.algorithm.adv_estimator
+            is_supo = (adv_estimator == "supo" or 
+                       (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
+            if is_supo:
+                # SUPO mode: don't unpad, output trajectory count is dynamic
+                test_output_gen_batch = test_output_gen_batch_padded
+            else:
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
