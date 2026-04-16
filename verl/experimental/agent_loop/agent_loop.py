@@ -798,16 +798,34 @@ class AgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        # SUPO: 不同trajectory可能有不同的prompt长度，需要先padding到相同长度
+        def pad_to_max_length(tensors: list[torch.Tensor], pad_value: int = 0, pad_side: str = "left") -> torch.Tensor:
+            """Pad tensors to the same length and concatenate."""
+            max_len = max(t.size(-1) for t in tensors)
+            padded = []
+            for t in tensors:
+                if t.size(-1) < max_len:
+                    pad_size = max_len - t.size(-1)
+                    if pad_side == "left":
+                        padding = torch.full((*t.shape[:-1], pad_size), pad_value, dtype=t.dtype, device=t.device)
+                        t = torch.cat([padding, t], dim=-1)
+                    else:
+                        padding = torch.full((*t.shape[:-1], pad_size), pad_value, dtype=t.dtype, device=t.device)
+                        t = torch.cat([t, padding], dim=-1)
+                padded.append(t)
+            return torch.cat(padded, dim=0)
+        
         # Convert lists back to tensors and stack them to create a batch.
-        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
-        response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
-        response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
-        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
-        input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
-        position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+        # Use padding for prompt_ids and related tensors to handle SUPO variable lengths
+        prompt_ids = pad_to_max_length([input.prompt_ids for input in inputs], pad_value=0, pad_side="left")
+        response_ids = pad_to_max_length([input.response_ids for input in inputs], pad_value=0, pad_side="right")
+        response_mask = pad_to_max_length([input.response_mask for input in inputs], pad_value=0, pad_side="right")
+        attention_mask = pad_to_max_length([input.attention_mask for input in inputs], pad_value=0, pad_side="left")
+        input_ids = pad_to_max_length([input.input_ids for input in inputs], pad_value=0, pad_side="left")
+        position_ids = pad_to_max_length([input.position_ids for input in inputs], pad_value=0, pad_side="left")
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+            optional_outputs["rollout_log_probs"] = pad_to_max_length([input.response_logprobs for input in inputs], pad_value=0, pad_side="right")
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 
