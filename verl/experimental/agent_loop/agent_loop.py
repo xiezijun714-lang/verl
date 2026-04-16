@@ -1074,6 +1074,11 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        
+        # SUPO: 不同worker可能有不同的max padding长度，需要统一
+        if len(outputs) > 1:
+            outputs = self._align_dataproto_shapes(outputs)
+        
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
@@ -1082,6 +1087,62 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    def _align_dataproto_shapes(self, outputs: list) -> list:
+        """SUPO: Align tensor shapes across different DataProto outputs from different workers."""
+        import torch
+        
+        # 找出每个tensor key的全局最大长度
+        all_keys = set()
+        for output in outputs:
+            if output.batch is not None:
+                all_keys.update(output.batch.keys())
+        
+        # 对于需要padding的key，计算全局最大长度
+        # 左padding的key（prompt相关）
+        left_pad_keys = {"prompts", "input_ids", "attention_mask", "position_ids"}
+        # 右padding的key（response相关）  
+        right_pad_keys = {"responses", "response_mask", "rollout_log_probs"}
+        
+        global_max_lens = {}
+        for key in all_keys:
+            max_len = 0
+            for output in outputs:
+                if output.batch is not None and key in output.batch.keys():
+                    tensor = output.batch[key]
+                    if tensor.dim() >= 2:
+                        max_len = max(max_len, tensor.size(-1))
+            if max_len > 0:
+                global_max_lens[key] = max_len
+        
+        # Padding每个output到全局最大长度
+        for output in outputs:
+            if output.batch is None:
+                continue
+            for key in list(output.batch.keys()):
+                if key not in global_max_lens:
+                    continue
+                tensor = output.batch[key]
+                if tensor.dim() < 2:
+                    continue
+                target_len = global_max_lens[key]
+                current_len = tensor.size(-1)
+                if current_len < target_len:
+                    pad_size = target_len - current_len
+                    if key in left_pad_keys:
+                        # 左padding
+                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
+                        output.batch[key] = torch.cat([padding, tensor], dim=-1)
+                    elif key in right_pad_keys:
+                        # 右padding
+                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
+                        output.batch[key] = torch.cat([tensor, padding], dim=-1)
+                    # 其他key默认右padding
+                    else:
+                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
+                        output.batch[key] = torch.cat([tensor, padding], dim=-1)
+        
+        return outputs
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
