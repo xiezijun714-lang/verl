@@ -36,7 +36,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, pad_supo_dummy_trajectories, unpad_supo_dummy_trajectories
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -210,6 +210,16 @@ def compute_advantage(
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
+
+        # SUPO: 添加trajectory相关参数
+        if adv_estimator == "supo" or (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"):
+            if "rollout_id" in data.non_tensor_batch:
+                adv_kwargs["rollout_id"] = data.non_tensor_batch["rollout_id"]
+            if "is_final" in data.non_tensor_batch:
+                adv_kwargs["is_final"] = data.non_tensor_batch["is_final"]
+            if "overlong" in data.non_tensor_batch:
+                adv_kwargs["overlong"] = data.non_tensor_batch["overlong"]
+            adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -1500,9 +1510,25 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # SUPO: dummy trajectory padding
+                        supo_pad_size = 0
+                        adv_estimator = self.config.algorithm.adv_estimator
+                        is_supo = (adv_estimator == "supo" or 
+                                   (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
+                        if is_supo:
+                            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+                            batch, supo_pad_size = pad_supo_dummy_trajectories(batch, ppo_mini_batch_size)
+                            if supo_pad_size > 0:
+                                metrics["supo/dummy_pad_size"] = supo_pad_size
+                        
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        
+                        # SUPO: 移除dummy trajectories (如果后续还需要用batch)
+                        if supo_pad_size > 0:
+                            batch = unpad_supo_dummy_trajectories(batch, supo_pad_size)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(

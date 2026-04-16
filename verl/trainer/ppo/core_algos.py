@@ -357,6 +357,101 @@ def compute_grpo_vectorized_outcome_advantage(
         return advantages, advantages
 
 
+@register_adv_est("supo")
+def compute_supo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    rollout_id: np.ndarray,
+    is_final: np.ndarray,
+    overlong: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    SUPO (Summarization augmented Policy Optimization) 优势计算
+    
+    核心逻辑：
+    1. 每个rollout可能产生多条trajectory，只有final trajectory有reward
+    2. 按uid (index) 分组计算GRPO风格的优势
+    3. 同一rollout的所有trajectory共享相同的优势值
+    4. overlong的rollout优势为0
+    
+    Args:
+        token_level_rewards: (bs, response_length) - 每个token的reward
+        response_mask: (bs, response_length) - LLM生成的token mask
+        index: (bs,) - uid，用于分组计算GRPO优势
+        rollout_id: (bs,) - rollout标识，同一rollout的trajectory共享优势
+        is_final: (bs,) - 是否为final trajectory
+        overlong: (bs,) - 是否因超长被终止
+        epsilon: float - 数值稳定性
+        norm_adv_by_std_in_grpo: bool - 是否按std归一化优势
+        config: (AlgoConfig) - 算法配置
+    
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length)
+    """
+    with torch.no_grad():
+        bs = token_level_rewards.shape[0]
+        scores = token_level_rewards.sum(dim=-1)  # (bs,) - 每条数据的total reward
+        
+        # Step 1: 建立 rollout_id -> reward 映射（只从final trajectory获取）
+        rollout_to_reward = {}
+        for i in range(bs):
+            rid = rollout_id[i]
+            if is_final[i] and not overlong[i]:
+                # Final trajectory的reward是这个rollout的outcome reward
+                rollout_to_reward[rid] = scores[i].item()
+            elif rid not in rollout_to_reward:
+                # 非final或overlong的rollout，reward为0
+                rollout_to_reward[rid] = 0.0
+        
+        # Step 2: 按uid分组，计算每个rollout的GRPO优势
+        # 首先获取每个uid的unique rollouts及其rewards
+        uid_to_rollout_rewards = defaultdict(list)
+        seen_rollouts = set()
+        for i in range(bs):
+            uid = index[i]
+            rid = rollout_id[i]
+            if rid not in seen_rollouts:
+                seen_rollouts.add(rid)
+                uid_to_rollout_rewards[uid].append((rid, rollout_to_reward.get(rid, 0.0)))
+        
+        # 计算每个rollout的优势值
+        rollout_to_advantage = {}
+        for uid, rollout_list in uid_to_rollout_rewards.items():
+            rewards = torch.tensor([r for _, r in rollout_list], dtype=token_level_rewards.dtype)
+            if len(rewards) == 1:
+                # 只有一个rollout，优势为0
+                for rid, _ in rollout_list:
+                    rollout_to_advantage[rid] = 0.0
+            else:
+                mean_r = rewards.mean()
+                std_r = rewards.std()
+                for rid, r in rollout_list:
+                    if norm_adv_by_std_in_grpo:
+                        adv = (r - mean_r) / (std_r + epsilon)
+                    else:
+                        adv = r - mean_r
+                    rollout_to_advantage[rid] = adv.item()
+        
+        # Step 3: 将优势传播到每条trajectory
+        advantages = torch.zeros_like(token_level_rewards)
+        for i in range(bs):
+            if overlong[i]:
+                # Overlong的trajectory优势为0
+                adv = 0.0
+            else:
+                rid = rollout_id[i]
+                adv = rollout_to_advantage.get(rid, 0.0)
+            advantages[i, :] = adv * response_mask[i, :]
+        
+        return advantages, advantages
+
+
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,

@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -47,6 +48,16 @@ class AgentState(Enum):
     PROCESSING_TOOLS = "processing_tools"
     TERMINATED = "terminated"
     INTERACTING = "interacting"
+
+
+@dataclass
+class TrajectoryOutput:
+    """SUPO: 单条子轨迹的输出数据"""
+    prompt_ids: list[int]
+    response_ids: list[int]
+    response_mask: list[int]
+    response_logprobs: list[float]
+    is_final: bool = False
 
 
 class AgentData:
@@ -91,6 +102,18 @@ class AgentData:
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
+        # ========== SUPO (Summarization augmented Policy Optimization) 相关字段 ==========
+        self.original_prompt_ids: list[int] = []  # 保存原始prompt s_1
+        self.summary_count: int = 0  # 已执行的摘要轮次 I
+        self.trajectory_outputs: list[TrajectoryOutput] = []  # 累积的子轨迹输出
+        self.is_summarizing: bool = False  # 当前是否在生成摘要（v_sum ∈ s_t）
+        self.overlong: bool = False  # 是否因超长被终止
+        # 当前trajectory累积的response（用于保存trajectory）
+        self.current_traj_prompt_ids: list[int] = []
+        self.accumulated_response_ids: list[int] = []
+        self.accumulated_response_mask: list[int] = []
+        self.accumulated_logprobs: list[float] = []
+
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
@@ -120,8 +143,18 @@ class ToolAgentLoop(AgentLoopBase):
                 self.interaction_config_file
             )
 
+        # ========== SUPO (Summarization augmented Policy Optimization) 配置 ==========
+        self.enable_summarization = getattr(self.rollout_config.multi_turn, 'enable_summarization', False)
+        self.max_summary_rounds = getattr(self.rollout_config.multi_turn, 'max_summary_rounds', 2)
+        self.working_context_length = getattr(self.rollout_config.multi_turn, 'working_context_length', 8192)
+        self.summary_instruction = getattr(
+            self.rollout_config.multi_turn, 
+            'summary_instruction', 
+            "请总结之前的交互历史，保留关键决策信息，以便继续完成任务：\n"
+        )
+
     @rollout_trace_op
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
         messages = list(kwargs["raw_prompt"])
 
         # extract images and videos from messages
@@ -175,6 +208,75 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
+        # ========== SUPO: 多条trajectory输出 ==========
+        if self.enable_summarization:
+            # 保存最终trajectory（如果不是overlong）
+            if not agent_data.overlong and agent_data.accumulated_response_ids:
+                self._save_final_trajectory(agent_data)
+            
+            # 生成多条AgentLoopOutput
+            outputs = []
+            multi_modal_data_dict = {}
+            if agent_data.image_data is not None:
+                multi_modal_data_dict["images"] = agent_data.image_data
+            if agent_data.video_data is not None:
+                multi_modal_data_dict["videos"] = agent_data.video_data
+            
+            rollout_id = f"{request_id}_rollout"
+            uid = kwargs.get("extra_info", {}).get("uid", request_id)
+            
+            for i, traj in enumerate(agent_data.trajectory_outputs):
+                output = AgentLoopOutput(
+                    prompt_ids=traj.prompt_ids,
+                    response_ids=traj.response_ids[: self.response_length],
+                    response_mask=traj.response_mask[: self.response_length],
+                    multi_modal_data=multi_modal_data_dict if i == len(agent_data.trajectory_outputs) - 1 else {},
+                    response_logprobs=traj.response_logprobs[: self.response_length] if traj.response_logprobs else None,
+                    num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+                    metrics=agent_data.metrics,
+                    routed_experts=agent_data.routed_experts if i == len(agent_data.trajectory_outputs) - 1 else None,
+                    extra_fields={
+                        "traj_idx": i,
+                        "is_final": traj.is_final,
+                        "overlong": agent_data.overlong,
+                        "rollout_id": rollout_id,
+                        "uid": uid,
+                        "turn_scores": agent_data.turn_scores,
+                        "tool_rewards": agent_data.tool_rewards,
+                    },
+                )
+                outputs.append(output)
+            
+            logger.info(
+                f"SUPO: Rollout completed. Generated {len(outputs)} trajectories. "
+                f"overlong={agent_data.overlong}, summary_count={agent_data.summary_count}"
+            )
+            
+            # 如果没有任何trajectory输出（极端情况），返回一个空结果
+            if not outputs:
+                outputs = [AgentLoopOutput(
+                    prompt_ids=agent_data.original_prompt_ids,
+                    response_ids=[],
+                    response_mask=[],
+                    multi_modal_data=multi_modal_data_dict,
+                    response_logprobs=None,
+                    num_turns=0,
+                    metrics=agent_data.metrics,
+                    routed_experts=None,
+                    extra_fields={
+                        "traj_idx": 0,
+                        "is_final": True,
+                        "overlong": True,
+                        "rollout_id": rollout_id,
+                        "uid": uid,
+                        "turn_scores": [],
+                        "tool_rewards": [],
+                    },
+                )]
+            
+            return outputs
+
+        # ========== 原有逻辑：非SUPO模式 ==========
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
@@ -209,6 +311,12 @@ class ToolAgentLoop(AgentLoopBase):
             videos=agent_data.video_data,
         )
         agent_data.prompt_ids = prompt_ids
+        
+        # SUPO: 保存原始prompt用于摘要后重置
+        if self.enable_summarization:
+            agent_data.original_prompt_ids = list(prompt_ids)
+            agent_data.current_traj_prompt_ids = list(prompt_ids)
+        
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -249,6 +357,30 @@ class ToolAgentLoop(AgentLoopBase):
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
+
+        # ========== SUPO: 处理摘要生成阶段 ==========
+        if self.enable_summarization and agent_data.is_summarizing:
+            # 当前生成的是摘要内容，追加到当前trajectory末尾
+            self._append_summary_to_current_trajectory(agent_data, output.log_probs or [])
+            
+            # 重置上下文: s_{t+1} = (s_1, summary)
+            agent_data.prompt_ids = agent_data.original_prompt_ids + agent_data.response_ids
+            agent_data.response_mask = []
+            agent_data.response_logprobs = []
+            agent_data.is_summarizing = False
+            agent_data.summary_count += 1
+            
+            # 开始新的trajectory
+            self._start_new_trajectory(agent_data)
+            
+            logger.info(f"SUPO: Summary generated, reset context. summary_count={agent_data.summary_count}")
+            return AgentState.GENERATING
+
+        # ========== SUPO: 累积当前轮的response ==========
+        if self.enable_summarization:
+            agent_data.accumulated_response_ids.extend(agent_data.response_ids)
+            agent_data.accumulated_response_mask.extend([1] * len(agent_data.response_ids))
+            agent_data.accumulated_logprobs.extend(output.log_probs or [0.0] * len(agent_data.response_ids))
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
@@ -352,7 +484,7 @@ class ToolAgentLoop(AgentLoopBase):
         if self.tool_parser_name == "gpt-oss":
             logger.info("manually format tool responses for gpt-oss")
             tool_response_text = build_gpt_oss_tool_response_text(add_messages, tool_call_names)
-            response_ids = await self.loop.run_in_executor(
+            tool_response_ids = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
             )
         else:
@@ -360,14 +492,57 @@ class ToolAgentLoop(AgentLoopBase):
             # to stay compatible with downstream image processing logic!
             images = new_images_this_turn if new_images_this_turn else None
             videos = None
-            response_ids = await self.apply_chat_template(
+            tool_response_ids = await self.apply_chat_template(
                 add_messages,
                 images=images,
                 videos=videos,
                 remove_system_prompt=True,
             )
 
-        if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+        # ========== SUPO: Algorithm 2 上下文超限检测 ==========
+        if self.enable_summarization:
+            # 计算 L_t = |s_t, a_t, o_t| (当前上下文 + 当前response + 工具结果)
+            new_context_length = len(agent_data.prompt_ids) + len(tool_response_ids)
+            
+            if new_context_length >= self.working_context_length:
+                # 超限！根据Algorithm 2: 丢弃当前轮的 a_t 和 o_t
+                logger.info(
+                    f"SUPO: Context overflow detected. L_t={new_context_length} >= L={self.working_context_length}. "
+                    f"Discarding current turn (a_t, o_t). summary_count={agent_data.summary_count}"
+                )
+                
+                if agent_data.summary_count < self.max_summary_rounds:
+                    # 保存当前trajectory（不含被丢弃的当前轮 a_t 和 o_t）
+                    # 注意：当前轮的a_t已经在_handle_generating_state中被累积了，需要撤销
+                    self._save_current_trajectory_without_current_turn(agent_data)
+                    
+                    # 追加摘要指令 v_sum
+                    summary_instruction_ids = await self.loop.run_in_executor(
+                        None, lambda: self.tokenizer.encode(self.summary_instruction, add_special_tokens=False)
+                    )
+                    
+                    # 重置prompt为当前状态(不含被丢弃的a_t,o_t) + 摘要指令
+                    # prompt_ids目前包含 [..., a_t]，需要移除a_t
+                    prompt_without_at = agent_data.prompt_ids[:-len(agent_data.response_ids)]
+                    agent_data.prompt_ids = prompt_without_at + summary_instruction_ids
+                    
+                    # 重置response相关状态
+                    agent_data.response_mask = []
+                    agent_data.response_logprobs = []
+                    agent_data.is_summarizing = True
+                    
+                    logger.info(f"SUPO: Triggering summarization. Appended summary instruction.")
+                    return AgentState.GENERATING
+                else:
+                    # 达到最大摘要次数，标记overlong
+                    agent_data.overlong = True
+                    logger.warning(
+                        f"SUPO: Reached max summary rounds ({self.max_summary_rounds}). Marking as overlong."
+                    )
+                    return AgentState.TERMINATED
+
+        # ========== 正常流程：未超限或未启用SUPO ==========
+        if len(agent_data.response_mask) + len(tool_response_ids) >= self.response_length:
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
@@ -379,11 +554,17 @@ class ToolAgentLoop(AgentLoopBase):
             for img in new_images_this_turn:
                 agent_data.image_data.append(img)
 
-        agent_data.prompt_ids += response_ids
-        agent_data.response_mask += [0] * len(response_ids)
+        agent_data.prompt_ids += tool_response_ids
+        agent_data.response_mask += [0] * len(tool_response_ids)
         if agent_data.response_logprobs:
-            agent_data.response_logprobs += [0.0] * len(response_ids)
+            agent_data.response_logprobs += [0.0] * len(tool_response_ids)
         agent_data.user_turns += 1
+
+        # SUPO: 累积工具结果到当前trajectory
+        if self.enable_summarization:
+            agent_data.accumulated_response_ids.extend(tool_response_ids)
+            agent_data.accumulated_response_mask.extend([0] * len(tool_response_ids))
+            agent_data.accumulated_logprobs.extend([0.0] * len(tool_response_ids))
 
         # Terminate if any tool is a stop/finish tool
         if any(name.lower() in ("finish", "stop", "submit") for name in tool_call_names):
@@ -487,3 +668,100 @@ class ToolAgentLoop(AgentLoopBase):
 
         interaction_map = initialize_interactions_from_config(interaction_config_file)
         return interaction_map
+
+    # ========== SUPO 辅助方法 ==========
+
+    def _save_current_trajectory_without_current_turn(self, agent_data: AgentData):
+        """
+        SUPO: 保存当前trajectory，但不包含当前轮的a_t（因为已被丢弃）
+        当前轮的a_t已经被添加到accumulated_response中，需要撤销
+        """
+        # 从accumulated中移除当前轮的a_t（最后一次生成的response）
+        len_current_at = len(agent_data.response_ids)
+        if len_current_at > 0 and len(agent_data.accumulated_response_ids) >= len_current_at:
+            response_ids = agent_data.accumulated_response_ids[:-len_current_at]
+            response_mask = agent_data.accumulated_response_mask[:-len_current_at]
+            response_logprobs = agent_data.accumulated_logprobs[:-len_current_at]
+        else:
+            response_ids = agent_data.accumulated_response_ids
+            response_mask = agent_data.accumulated_response_mask
+            response_logprobs = agent_data.accumulated_logprobs
+
+        agent_data.trajectory_outputs.append(TrajectoryOutput(
+            prompt_ids=list(agent_data.current_traj_prompt_ids),
+            response_ids=response_ids,
+            response_mask=response_mask,
+            response_logprobs=response_logprobs,
+            is_final=False,
+        ))
+        
+        logger.info(
+            f"SUPO: Saved trajectory {len(agent_data.trajectory_outputs)-1} "
+            f"(without current turn). prompt_len={len(agent_data.current_traj_prompt_ids)}, "
+            f"response_len={len(response_ids)}"
+        )
+
+    def _append_summary_to_current_trajectory(self, agent_data: AgentData, summary_logprobs: list[float]):
+        """
+        SUPO: 将摘要指令和摘要内容追加到当前trajectory的response末尾
+        - 摘要指令 (v_sum): response_mask=0 (不是LLM生成)
+        - 摘要内容: response_mask=1 (LLM生成)
+        """
+        if not agent_data.trajectory_outputs:
+            logger.warning("SUPO: No trajectory to append summary to!")
+            return
+        
+        last_traj = agent_data.trajectory_outputs[-1]
+        
+        # 追加摘要指令 (response_mask=0)
+        summary_instruction_ids = self.tokenizer.encode(self.summary_instruction, add_special_tokens=False)
+        last_traj.response_ids.extend(summary_instruction_ids)
+        last_traj.response_mask.extend([0] * len(summary_instruction_ids))
+        last_traj.response_logprobs.extend([0.0] * len(summary_instruction_ids))
+        
+        # 追加摘要内容 (response_mask=1, 使用实际logprobs)
+        last_traj.response_ids.extend(agent_data.response_ids)
+        last_traj.response_mask.extend([1] * len(agent_data.response_ids))
+        if summary_logprobs:
+            last_traj.response_logprobs.extend(summary_logprobs)
+        else:
+            last_traj.response_logprobs.extend([0.0] * len(agent_data.response_ids))
+        
+        logger.info(
+            f"SUPO: Appended summary to trajectory {len(agent_data.trajectory_outputs)-1}. "
+            f"instruction_len={len(summary_instruction_ids)}, summary_len={len(agent_data.response_ids)}"
+        )
+
+    def _start_new_trajectory(self, agent_data: AgentData):
+        """
+        SUPO: 开始新的trajectory，重置累积状态
+        新trajectory的prompt = original_prompt + 摘要内容
+        """
+        # 新trajectory的prompt是重置后的prompt (已在_handle_generating_state中设置)
+        agent_data.current_traj_prompt_ids = list(agent_data.prompt_ids)
+        agent_data.accumulated_response_ids = []
+        agent_data.accumulated_response_mask = []
+        agent_data.accumulated_logprobs = []
+        
+        logger.info(
+            f"SUPO: Started new trajectory {len(agent_data.trajectory_outputs)}. "
+            f"prompt_len={len(agent_data.current_traj_prompt_ids)}"
+        )
+
+    def _save_final_trajectory(self, agent_data: AgentData):
+        """
+        SUPO: 保存最终trajectory，包含当前累积的所有response
+        """
+        agent_data.trajectory_outputs.append(TrajectoryOutput(
+            prompt_ids=list(agent_data.current_traj_prompt_ids),
+            response_ids=list(agent_data.accumulated_response_ids),
+            response_mask=list(agent_data.accumulated_response_mask),
+            response_logprobs=list(agent_data.accumulated_logprobs),
+            is_final=True,
+        ))
+        
+        logger.info(
+            f"SUPO: Saved final trajectory {len(agent_data.trajectory_outputs)-1}. "
+            f"prompt_len={len(agent_data.current_traj_prompt_ids)}, "
+            f"response_len={len(agent_data.accumulated_response_ids)}"
+        )

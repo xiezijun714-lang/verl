@@ -526,7 +526,15 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
+        # SUPO: Flatten outputs - 每个样本可能返回多条trajectory
+        flat_outputs = []
+        for output in outputs:
+            if isinstance(output, list):
+                flat_outputs.extend(output)
+            else:
+                flat_outputs.append(output)
+        
+        output = self._postprocess(flat_outputs, input_non_tensor_batch=batch.non_tensor_batch)
 
         return output
 
@@ -538,7 +546,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -561,8 +569,18 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            output = await agent_loop.run(sampling_params, **kwargs)
+            
+            # SUPO: 处理list[AgentLoopOutput]返回
+            if isinstance(output, list):
+                # 对每个trajectory调用后处理
+                processed_outputs = []
+                for single_output in output:
+                    processed = await self._agent_loop_postprocess(single_output, **kwargs)
+                    processed_outputs.append(processed)
+                return processed_outputs
+            else:
+                return await self._agent_loop_postprocess(output, **kwargs)
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -842,6 +860,12 @@ class AgentLoopWorker:
             "min_global_steps",
             "max_global_steps",
             "extras",
+            # SUPO: 添加trajectory相关字段
+            "uid",
+            "rollout_id",
+            "traj_idx",
+            "is_final",
+            "overlong",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:

@@ -105,6 +105,61 @@ def unpad_dataproto(data: "DataProto", pad_size):
     return data
 
 
+def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tuple["DataProto", int]:
+    """
+    SUPO: 将batch padding到mini_batch_size的整数倍
+    
+    创建dummy trajectory（response_mask=0）来padding，这样不会贡献梯度。
+    
+    Args:
+        data: DataProto containing trajectories
+        mini_batch_size: mini batch size (B_mini)
+        
+    Returns:
+        padded_data: DataProto padded to ceil(N/B_mini) * B_mini
+        pad_size: number of dummy trajectories added
+    """
+    import torch
+    
+    current_size = len(data)
+    if current_size == 0 or current_size % mini_batch_size == 0:
+        return data, 0
+    
+    pad_size = mini_batch_size - (current_size % mini_batch_size)
+    
+    # 创建dummy trajectories: 复制数据结构但把关键字段置0
+    dummy_indices = list(range(min(pad_size, current_size)))
+    while len(dummy_indices) < pad_size:
+        dummy_indices.extend(list(range(min(pad_size - len(dummy_indices), current_size))))
+    dummy_indices = dummy_indices[:pad_size]
+    
+    dummy_data = data[dummy_indices]
+    
+    # 将dummy trajectory的关键字段置0
+    if dummy_data.batch is not None:
+        if "response_mask" in dummy_data.batch.keys():
+            dummy_data.batch["response_mask"] = torch.zeros_like(dummy_data.batch["response_mask"])
+        if "advantages" in dummy_data.batch.keys():
+            dummy_data.batch["advantages"] = torch.zeros_like(dummy_data.batch["advantages"])
+        if "returns" in dummy_data.batch.keys():
+            dummy_data.batch["returns"] = torch.zeros_like(dummy_data.batch["returns"])
+    
+    if "is_dummy" not in dummy_data.non_tensor_batch:
+        dummy_data.non_tensor_batch["is_dummy"] = np.ones(pad_size, dtype=bool)
+    else:
+        dummy_data.non_tensor_batch["is_dummy"][:] = True
+    
+    padded_data = DataProto.concat([data, dummy_data])
+    return padded_data, pad_size
+
+
+def unpad_supo_dummy_trajectories(data: "DataProto", pad_size: int) -> "DataProto":
+    """移除SUPO dummy trajectories"""
+    if pad_size > 0:
+        return data[:-pad_size]
+    return data
+
+
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Union two tensordicts."""
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, (

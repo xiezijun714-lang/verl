@@ -60,6 +60,12 @@ class MultiTurnConfig(BaseConfig):
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
 
+    # SUPO (Summarization augmented Policy Optimization) configuration
+    enable_summarization: bool = False  # Enable SUPO summarization mechanism
+    max_summary_rounds: int = 2  # Maximum summarization rounds S
+    working_context_length: int = 8192  # Working context length threshold L
+    summary_instruction: str = "The interaction history is now too long. Please summarize the interaction history. Remember to keep the important information in the history to ensure that you can continue solving the problem. Do not call any function in this turn. Now generate the summary:\n"
+
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):
