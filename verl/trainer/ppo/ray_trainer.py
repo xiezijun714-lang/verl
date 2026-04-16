@@ -571,7 +571,15 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_batch = test_batch.union(test_output_gen_batch)
+            # SUPO: batch size may differ due to trajectory splitting, skip union
+            adv_estimator = self.config.algorithm.adv_estimator
+            is_supo = (adv_estimator == "supo" or 
+                       (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
+            if is_supo:
+                # In SUPO mode, use output batch directly (uid etc. are in non_tensor_batch)
+                test_batch = test_output_gen_batch
+            else:
+                test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
             # Store original inputs
