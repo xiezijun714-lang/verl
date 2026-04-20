@@ -372,83 +372,73 @@ def compute_supo_advantage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     SUPO (Summarization augmented Policy Optimization) 优势计算
-    
+
     核心逻辑：
     1. 每个rollout可能产生多条trajectory，只有final trajectory有reward
     2. 按uid (index) 分组计算GRPO风格的优势
     3. 同一rollout的所有trajectory共享相同的优势值
     4. overlong的rollout优势为0
-    
-    Args:
-        token_level_rewards: (bs, response_length) - 每个token的reward
-        response_mask: (bs, response_length) - LLM生成的token mask
-        index: (bs,) - uid，用于分组计算GRPO优势
-        rollout_id: (bs,) - rollout标识，同一rollout的trajectory共享优势
-        is_final: (bs,) - 是否为final trajectory
-        overlong: (bs,) - 是否因超长被终止
-        epsilon: float - 数值稳定性
-        norm_adv_by_std_in_grpo: bool - 是否按std归一化优势
-        config: (AlgoConfig) - 算法配置
-    
-    Returns:
-        advantages: (bs, response_length)
-        returns: (bs, response_length)
     """
     with torch.no_grad():
         bs = token_level_rewards.shape[0]
-        scores = token_level_rewards.sum(dim=-1)  # (bs,) - 每条数据的total reward
-        
-        # Step 1: 建立 rollout_id -> reward 映射（只从final trajectory获取）
+        scores = token_level_rewards.float().sum(dim=-1)
+
+        # 统一转为 Python 标量数组，避免后续重复 .item() 判断
+        rid_arr = np.asarray(rollout_id).flatten()
+        uid_arr = np.asarray(index).flatten()
+        is_final_arr = np.asarray(is_final).flatten().astype(bool)
+        overlong_arr = np.asarray(overlong).flatten().astype(bool)
+
+        # Pass 1: 收集每个 rollout 的 reward 和 overlong 状态
         rollout_to_reward = {}
+        rollout_is_overlong = set()
+        uid_to_rids = defaultdict(set)
+
         for i in range(bs):
-            rid = rollout_id[i]
-            if is_final[i] and not overlong[i]:
-                # Final trajectory的reward是这个rollout的outcome reward
+            rid = int(rid_arr[i])
+            uid = int(uid_arr[i])
+            uid_to_rids[uid].add(rid)
+            if overlong_arr[i]:
+                rollout_is_overlong.add(rid)
+            if is_final_arr[i] and not overlong_arr[i]:
                 rollout_to_reward[rid] = scores[i].item()
-            elif rid not in rollout_to_reward:
-                # 非final或overlong的rollout，reward为0
-                rollout_to_reward[rid] = 0.0
-        
-        # Step 2: 按uid分组，计算每个rollout的GRPO优势
-        # 首先获取每个uid的unique rollouts及其rewards
-        uid_to_rollout_rewards = defaultdict(list)
-        seen_rollouts = set()
-        for i in range(bs):
-            uid = index[i]
-            rid = rollout_id[i]
-            if rid not in seen_rollouts:
-                seen_rollouts.add(rid)
-                uid_to_rollout_rewards[uid].append((rid, rollout_to_reward.get(rid, 0.0)))
-        
-        # 计算每个rollout的优势值
+
+        # Pass 2: 按 uid 分组计算 GRPO 优势
         rollout_to_advantage = {}
-        for uid, rollout_list in uid_to_rollout_rewards.items():
-            rewards = torch.tensor([r for _, r in rollout_list], dtype=token_level_rewards.dtype)
-            if len(rewards) == 1:
-                # 只有一个rollout，优势为0
-                for rid, _ in rollout_list:
+        for uid, rids in uid_to_rids.items():
+            valid_rids = [rid for rid in rids if rid not in rollout_is_overlong]
+
+            # 有效 rollout 不足 2 个，无法计算对比优势
+            if len(valid_rids) <= 1:
+                for rid in rids:
                     rollout_to_advantage[rid] = 0.0
-            else:
-                mean_r = rewards.mean()
-                std_r = rewards.std()
-                for rid, r in rollout_list:
-                    if norm_adv_by_std_in_grpo:
-                        adv = (r - mean_r) / (std_r + epsilon)
-                    else:
-                        adv = r - mean_r
-                    rollout_to_advantage[rid] = adv.item()
-        
-        # Step 3: 将优势传播到每条trajectory
-        advantages = torch.zeros_like(token_level_rewards)
+                continue
+
+            valid_rewards = torch.tensor(
+                [rollout_to_reward.get(rid, 0.0) for rid in valid_rids], dtype=torch.float32
+            )
+            mean_r = valid_rewards.mean()
+            std_r = valid_rewards.std(unbiased=False)
+
+            for rid in rids:
+                if rid in rollout_is_overlong:
+                    rollout_to_advantage[rid] = 0.0
+                    continue
+                r = rollout_to_reward.get(rid, 0.0)
+                if norm_adv_by_std_in_grpo:
+                    adv = (r - mean_r.item()) / (std_r.item() + epsilon) if std_r.item() > epsilon else 0.0
+                else:
+                    adv = r - mean_r.item()
+                rollout_to_advantage[rid] = adv
+
+        # Pass 3: 广播到 token 维度
+        advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
         for i in range(bs):
-            if overlong[i]:
-                # Overlong的trajectory优势为0
-                adv = 0.0
-            else:
-                rid = rollout_id[i]
-                adv = rollout_to_advantage.get(rid, 0.0)
-            advantages[i, :] = adv * response_mask[i, :]
-        
+            rid = int(rid_arr[i])
+            adv = rollout_to_advantage.get(rid, 0.0)
+            advantages[i, :] = adv * response_mask[i, :].float()
+
+        advantages = advantages.to(token_level_rewards.dtype)
         return advantages, advantages
 
 
@@ -1677,71 +1667,6 @@ def compute_policy_loss_sapo(
 
     return pg_loss, pg_metrics
 
-@register_policy_loss("acpo")
-def compute_policy_loss_acpo(
-    old_log_prob: torch.Tensor,
-    log_prob: torch.Tensor,
-    advantages: torch.Tensor,
-    response_mask: torch.Tensor,
-    loss_agg_mode: str = "seq-mean-token-mean",
-    config: Optional[ActorConfig] = None,
-    rollout_is_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-
-    assert config is not None
-    assert isinstance(config, ActorConfig)
-
-    # temperature for positive and negative token updates
-    tau_pos = torch.as_tensor(config.tau_pos, dtype=advantages.dtype, device=advantages.device)
-    tau_neg = torch.as_tensor(config.tau_neg, dtype=advantages.dtype, device=advantages.device)
-
-    def gate_function(x, tau):
-        """The gating function used in SAPO"""
-        return torch.sigmoid(tau * (x - 1.0)) * (4.0 / tau)
-
-    # compute IS at token level:
-    # r_{i,t}(θ) = π_θ(y_{i,t}|x, y_{i,<t}) / π_θold(y_{i,t}|x, y_{i,<t})]
-    # In log space: log(r_{i,t}(θ)) = log_prob - ol_log_prob
-    negative_approx_kl = log_prob - old_log_prob
-    # Clamp negative_approx_kl for stability
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    # finally exp() to remove log and get r_{i,t}(θ)
-    ratio = torch.exp(negative_approx_kl)
-
-    # tau_{i,t} is tau_pos if adv > 0 else tau_neg
-    taus = torch.where(
-        condition=advantages > 0,
-        input=tau_pos,  # if A_{i,t} > 0 we set to tau_pos
-        other=tau_neg,  # if A_{i,t} <= 0 we set to tau_neg
-    )
-
-    # compute the gates f_{i,t}(r_{i,t}(θ)) at token level
-    gates = gate_function(ratio, taus)
-
-    # compute policy gradient loss
-    pg_losses = -gates * advantages
-
-    # Apply rollout correction weights if provided
-    if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
-        
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
-    )
-
-    # For compatibility, return zero for both pg_clipfrac and pg_clipfrac_lower (not used in SAPO)
-    pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
-    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
-    # compute KL for metrics tracking
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    # return metrics dict
-    pg_metrics = {
-        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-        "actor/ppo_kl": ppo_kl.detach().item(),
-        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-    }
-
-    return pg_loss, pg_metrics
 
 
 @register_policy_loss("gpg")

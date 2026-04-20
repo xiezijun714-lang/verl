@@ -70,17 +70,24 @@ class DataProtoConfig(metaclass=_DataProtoConfigMeta):
 _padding_size_key = "_padding_size_key_x123d"
 
 
-def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
+def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int, mark_padding: bool = False):
     """Pad a DataProto to size divisible by size_divisor
 
     Args:
         size_divisor (int): size divisor
+        mark_padding (bool): if True, mark padding samples with is_padding=True in non_tensor_batch
+                            This is useful for SUPO mode where we need to remove padding trajectories later.
 
     Returns:
         data: (DataProto): the padded DataProto
         pad_size (int)
     """
     assert isinstance(data, DataProto), "data must be a DataProto"
+    
+    # Add is_padding marker for original data if mark_padding is enabled
+    if mark_padding and "is_padding" not in data.non_tensor_batch:
+        data.non_tensor_batch["is_padding"] = np.zeros(len(data), dtype=bool)
+    
     if len(data) % size_divisor != 0:
         pad_size = size_divisor - len(data) % size_divisor
         padding_protos = []
@@ -90,6 +97,10 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
             padding_protos.append(data[:take_size])
             remaining_pad -= take_size
         data_padded = DataProto.concat([data] + padding_protos)
+        
+        # Mark the padded samples
+        if mark_padding:
+            data_padded.non_tensor_batch["is_padding"][len(data):] = True
     else:
         if len(data) == 0:
             logging.warning("padding a DataProto with no item, no changed made")
@@ -103,6 +114,64 @@ def unpad_dataproto(data: "DataProto", pad_size):
     if pad_size != 0:
         data = data[:-pad_size]
     return data
+
+
+def unpad_dataproto_by_marker(data: "DataProto") -> "DataProto":
+    """
+    Remove padding samples marked with is_padding=True.
+    
+    This is used for SUPO mode where trajectory count can change due to splitting,
+    but we still want to remove padding trajectories that came from padding inputs.
+    
+    Args:
+        data: DataProto with is_padding marker in non_tensor_batch
+        
+    Returns:
+        DataProto with padding samples removed
+    """
+    if "is_padding" not in data.non_tensor_batch:
+        return data
+    
+    is_padding = data.non_tensor_batch["is_padding"]
+    non_padding_indices = np.where(~is_padding)[0]
+    
+    if len(non_padding_indices) == len(data):
+        return data
+    
+    return data[non_padding_indices.tolist()]
+
+
+def expand_batch_by_uid(original_batch: "DataProto", target_uids: np.ndarray) -> "DataProto":
+    """
+    SUPO: Expand original batch to match target_uids length.
+
+    For each uid in target_uids, find the corresponding sample in original_batch
+    and copy its data. This allows union to work when trajectory count changes.
+
+    Args:
+        original_batch: Original DataProto with uid in non_tensor_batch
+        target_uids: Array of uids from the output (may have duplicates due to splitting)
+
+    Returns:
+        DataProto expanded to match target_uids length
+
+    Raises:
+        KeyError: If any uid in target_uids is not found in original_batch
+    """
+    original_uids = original_batch.non_tensor_batch["uid"]
+
+    # Build uid to index mapping
+    uid_to_idx = {uid: idx for idx, uid in enumerate(original_uids)}
+
+    # Find indices for each target uid
+    expand_indices = []
+    for uid in target_uids:
+        if uid in uid_to_idx:
+            expand_indices.append(uid_to_idx[uid])
+        else:
+            raise KeyError(f"uid '{uid}' not found in original batch. Available uids: {list(original_uids)[:5]}...")
+
+    return original_batch[expand_indices]
 
 
 def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tuple["DataProto", int]:
@@ -123,15 +192,21 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
     
     current_size = len(data)
     if current_size == 0 or current_size % mini_batch_size == 0:
+        # 即使不需要 padding，也要添加 is_dummy 字段
+        if "is_dummy" not in data.non_tensor_batch:
+            data.non_tensor_batch["is_dummy"] = np.zeros(current_size, dtype=bool)
         return data, 0
     
     pad_size = mini_batch_size - (current_size % mini_batch_size)
     
+    # 给原始 data 添加 is_dummy 字段（False）
+    if "is_dummy" not in data.non_tensor_batch:
+        data.non_tensor_batch["is_dummy"] = np.zeros(current_size, dtype=bool)
+    
     # 创建dummy trajectories: 复制数据结构但把关键字段置0
-    dummy_indices = list(range(min(pad_size, current_size)))
-    while len(dummy_indices) < pad_size:
-        dummy_indices.extend(list(range(min(pad_size - len(dummy_indices), current_size))))
-    dummy_indices = dummy_indices[:pad_size]
+    # 循环取索引直到填满 pad_size 个
+    import math
+    dummy_indices = (list(range(current_size)) * math.ceil(pad_size / current_size))[:pad_size]
     
     dummy_data = data[dummy_indices]
     
@@ -144,10 +219,8 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
         if "returns" in dummy_data.batch.keys():
             dummy_data.batch["returns"] = torch.zeros_like(dummy_data.batch["returns"])
     
-    if "is_dummy" not in dummy_data.non_tensor_batch:
-        dummy_data.non_tensor_batch["is_dummy"] = np.ones(pad_size, dtype=bool)
-    else:
-        dummy_data.non_tensor_batch["is_dummy"][:] = True
+    # 标记为 dummy
+    dummy_data.non_tensor_batch["is_dummy"] = np.ones(pad_size, dtype=bool)
     
     padded_data = DataProto.concat([data, dummy_data])
     return padded_data, pad_size

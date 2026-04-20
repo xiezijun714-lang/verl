@@ -36,7 +36,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, pad_supo_dummy_trajectories, unpad_supo_dummy_trajectories
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, pad_supo_dummy_trajectories, unpad_supo_dummy_trajectories, unpad_dataproto_by_marker, expand_batch_by_uid
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -212,7 +212,7 @@ def compute_advantage(
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
         # SUPO: 添加trajectory相关参数
-        if adv_estimator == "supo" or (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"):
+        if adv_estimator == "supo" or (hasattr(adv_estimator, 'value') and getattr(adv_estimator, 'value', None) == "supo"):
             if "rollout_id" in data.non_tensor_batch:
                 adv_kwargs["rollout_id"] = data.non_tensor_batch["rollout_id"]
             if "is_final" in data.non_tensor_batch:
@@ -309,6 +309,11 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+
+        # Cache SUPO mode flag
+        adv_estimator = self.config.algorithm.adv_estimator
+        self._is_supo = (adv_estimator == "supo" or
+                         (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -509,13 +514,23 @@ class RayPPOTrainer:
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
-        # Lists to collect samples for the table
+        # Lists to collect samples for metrics (final trajectories only for SUPO)
         sample_inputs = []
         sample_outputs = []
         sample_gts = []
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        
+        # SUPO: separate lists for val_outputs dump (ALL trajectories)
+        dump_inputs = []
+        dump_outputs = []
+        dump_gts = []
+        dump_scores = []
+        dump_extra_infos = {}
+
+        # SUPO: collect trajectory split statistics
+        supo_rollout_traj_counts = {}  # rollout_id -> max traj_idx + 1
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -530,10 +545,12 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
+            # Non-SUPO: collect ground_truths here (SUPO collects after union)
+            if not self._is_supo:
+                ground_truths = [
+                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+                ]
+                sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -548,87 +565,152 @@ class RayPPOTrainer:
 
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
+                test_gen_batch, size_divisor, mark_padding=self._is_supo
+            )
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
-                # for colocate reward models, we need to sleep rollout model
-                # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
-                # wake up rollout model
-                # replace with wake_up method once supported
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
-            # SUPO: output size differs from input, don't use input's pad_size
-            adv_estimator = self.config.algorithm.adv_estimator
-            is_supo = (adv_estimator == "supo" or 
-                       (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
-            if is_supo:
-                # SUPO mode: don't unpad, output trajectory count is dynamic
-                test_output_gen_batch = test_output_gen_batch_padded
+            if self._is_supo:
+                test_output_gen_batch = unpad_dataproto_by_marker(test_output_gen_batch_padded)
             else:
                 test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
-            # Store generated outputs
+            # SUPO: log rollout output stats (console only)
+            if self._is_supo:
+                self._log_supo_val_stats(test_output_gen_batch, test_batch, stage="post-rollout")
+
+            # SUPO: expand batch to match output trajectory count, then union
+            if self._is_supo:
+                if len(test_batch) != len(test_output_gen_batch):
+                    target_uids = test_output_gen_batch.non_tensor_batch["uid"]
+                    test_batch = expand_batch_by_uid(test_batch, target_uids)
+                self._remove_supo_duplicate_keys(test_batch, test_output_gen_batch)
+
+            # Collect outputs and union
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+            test_batch = test_batch.union(test_output_gen_batch)
 
-            # SUPO: batch size may differ due to trajectory splitting, skip union
-            adv_estimator = self.config.algorithm.adv_estimator
-            is_supo = (adv_estimator == "supo" or 
-                       (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
-            if is_supo:
-                # In SUPO mode, use output batch directly (uid etc. are in non_tensor_batch)
-                test_batch = test_output_gen_batch
-            else:
-                test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
-
-            # Store original inputs
-            input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)
 
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+            # Store original inputs and scores
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            scores_all = reward_tensor.sum(-1).cpu().tolist()
 
-            reward_extra_infos_dict["reward"].extend(scores)
+            # Determine which indices to use for metrics (SUPO: final only, else: all)
+            all_indices = list(range(len(input_texts)))
+            if self._is_supo and "is_final" in test_batch.non_tensor_batch:
+                final_indices = np.where(np.array(test_batch.non_tensor_batch["is_final"]))[0].tolist()
+            else:
+                final_indices = all_indices
+
+            # Dump: always ALL trajectories
+            dump_inputs.extend(input_texts)
+            dump_outputs.extend(output_texts)
+            dump_gts.extend([
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) 
+                for item in test_batch
+            ])
+            dump_scores.extend(scores_all)
+            for k, v in reward_extra_info.items():
+                if k not in dump_extra_infos:
+                    dump_extra_infos[k] = []
+                if isinstance(v, np.ndarray):
+                    dump_extra_infos[k].extend(v.tolist() if v.ndim > 0 else [v.tolist()])
+                elif isinstance(v, list):
+                    dump_extra_infos[k].extend(v)
+                else:
+                    dump_extra_infos[k].append(v)
+
+            # Metrics: final trajectories only (for non-SUPO, final_indices == all_indices)
+            sample_inputs.extend([input_texts[i] for i in final_indices])
+            sample_outputs.extend([output_texts[i] for i in final_indices])
+            sample_gts.extend([
+                test_batch[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", None) 
+                for i in final_indices
+            ])
+            scores_final = [scores_all[i] for i in final_indices]
+            sample_scores.extend(scores_final)
+            sample_uids.extend([test_batch.non_tensor_batch["uid"][i] for i in final_indices])
+
+            # Collect reward_extra_info for metrics
+            reward_extra_infos_dict["reward"].extend(scores_final)
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
                 if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
+                    values_list = [values[i] for i in final_indices] if values.ndim > 0 else [values.tolist()]
+                elif isinstance(values, list):
+                    values_list = [values[i] for i in final_indices]
                 else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+                    values_list = [values]
+                reward_extra_infos_dict[key].extend(values_list)
 
-            # collect num_turns of each prompt
+            # collect num_turns of each prompt (final only)
             if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+                num_turns = test_batch.non_tensor_batch["__num_turns__"]
+                if isinstance(num_turns, np.ndarray):
+                    sample_turns.append(num_turns[final_indices])
+                else:
+                    sample_turns.append([num_turns[i] for i in final_indices])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            # collect data_source (final only)
+            data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            if isinstance(data_sources, np.ndarray):
+                data_source_lst.append(data_sources[final_indices])
+            else:
+                data_source_lst.append([data_sources[i] for i in final_indices])
+            
+            # SUPO: collect trajectory split statistics
+            if self._is_supo and "rollout_id" in test_batch.non_tensor_batch and "traj_idx" in test_batch.non_tensor_batch:
+                rollout_ids = test_batch.non_tensor_batch["rollout_id"]
+                traj_idxs = test_batch.non_tensor_batch["traj_idx"]
+                for rid, tidx in zip(rollout_ids, traj_idxs):
+                    if rid not in supo_rollout_traj_counts:
+                        supo_rollout_traj_counts[rid] = 0
+                    supo_rollout_traj_counts[rid] = max(supo_rollout_traj_counts[rid], tidx + 1)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        
+        # SUPO: compute and log trajectory split statistics
+        supo_stats = {}
+        if self._is_supo and supo_rollout_traj_counts:
+            traj_counts = list(supo_rollout_traj_counts.values())
+            total_rollouts = len(traj_counts)
+            split_rollouts = sum(1 for c in traj_counts if c > 1)
+            split_ratio = split_rollouts / total_rollouts if total_rollouts > 0 else 0
+            max_splits = max(traj_counts) if traj_counts else 1
+            avg_splits = sum(traj_counts) / total_rollouts if total_rollouts > 0 else 1
+            
+            supo_stats = {
+                "supo_split_ratio": split_ratio,
+                "supo_max_splits": max_splits,
+                "supo_avg_splits": avg_splits,
+            }
 
-        # dump generations
+        # dump generations (ALL trajectories for SUPO, final for non-SUPO)
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            # Use dump lists (all trajectories) for val_outputs
             self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                inputs=dump_inputs,
+                outputs=dump_outputs,
+                gts=dump_gts,
+                scores=dump_scores,
+                reward_extra_infos_dict=dump_extra_infos,
                 dump_path=val_data_dir,
             )
 
@@ -636,15 +718,21 @@ class RayPPOTrainer:
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         if merged:
-            print("_merge_validation_results validate result will be merged")
             return {
                 "data_sources": data_source_lst,
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "supo_stats": supo_stats,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+        # Add SUPO stats to metrics (split_ratio, max_splits, avg_splits)
+        for key, val in supo_stats.items():
+            metric_dict[f"val-aux/supo/{key}"] = val
+
+        return metric_dict
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -672,6 +760,22 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    # Keys that SUPO passes through extra_fields and would conflict during union
+    _SUPO_DUPLICATE_KEYS = [
+        "uid", "data_source", "reward_model", "is_padding",
+        "traj_idx", "is_final", "rollout_id", "overlong",
+    ]
+
+    def _remove_supo_duplicate_keys(self, src_batch, gen_batch):
+        """Remove keys from src_batch that already exist in gen_batch to avoid union conflicts."""
+        for key in self._SUPO_DUPLICATE_KEYS:
+            if key in src_batch.non_tensor_batch and key in gen_batch.non_tensor_batch:
+                del src_batch.non_tensor_batch[key]
+
+    def _log_supo_val_stats(self, gen_batch, test_batch_pre, stage="post-rollout"):
+        """SUPO diagnostic logging for validation flow (console only, metrics are in supo_stats)."""
+        pass
 
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
@@ -1379,6 +1483,22 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    # SUPO: expand batch to match gen_batch_output length, then union
+                    if self._is_supo and len(batch) != len(gen_batch_output):
+                        target_uids = gen_batch_output.non_tensor_batch["uid"]
+                        n_pre = len(batch)
+                        batch = expand_batch_by_uid(batch, target_uids)
+                        n_post = len(batch)
+                        gen_uids = gen_batch_output.non_tensor_batch.get("uid", [])
+                        gen_is_final = gen_batch_output.non_tensor_batch.get("is_final", [])
+
+                    # SUPO: Remove duplicate keys from batch before union
+                    if self._is_supo:
+                        for key in self._SUPO_DUPLICATE_KEYS:
+                            if key in batch.non_tensor_batch and key in gen_batch_output.non_tensor_batch:
+                                del batch.non_tensor_batch[key]
+
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1528,15 +1648,12 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # SUPO: dummy trajectory padding
                         supo_pad_size = 0
-                        adv_estimator = self.config.algorithm.adv_estimator
-                        is_supo = (adv_estimator == "supo" or 
-                                   (hasattr(adv_estimator, 'value') and adv_estimator.value == "supo"))
-                        if is_supo:
+                        if self._is_supo:
                             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
                             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch, supo_pad_size = pad_supo_dummy_trajectories(batch, ppo_mini_batch_size)
                             if supo_pad_size > 0:
-                                metrics["supo/dummy_pad_size"] = supo_pad_size
+                                metrics["train/supo/dummy_pad_size"] = supo_pad_size
                         
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):

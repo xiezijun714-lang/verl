@@ -799,6 +799,9 @@ class AgentLoopWorker:
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # SUPO: 不同trajectory可能有不同的prompt长度，需要先padding到相同长度
+        # Use tokenizer's pad_token_id for padding (not 0, which might be '!' in some tokenizers)
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        
         def pad_to_max_length(tensors: list[torch.Tensor], pad_value: int = 0, pad_side: str = "left") -> torch.Tensor:
             """Pad tensors to the same length and concatenate."""
             max_len = max(t.size(-1) for t in tensors)
@@ -817,11 +820,11 @@ class AgentLoopWorker:
         
         # Convert lists back to tensors and stack them to create a batch.
         # Use padding for prompt_ids and related tensors to handle SUPO variable lengths
-        prompt_ids = pad_to_max_length([input.prompt_ids for input in inputs], pad_value=0, pad_side="left")
-        response_ids = pad_to_max_length([input.response_ids for input in inputs], pad_value=0, pad_side="right")
+        prompt_ids = pad_to_max_length([input.prompt_ids for input in inputs], pad_value=pad_token_id, pad_side="left")
+        response_ids = pad_to_max_length([input.response_ids for input in inputs], pad_value=pad_token_id, pad_side="right")
         response_mask = pad_to_max_length([input.response_mask for input in inputs], pad_value=0, pad_side="right")
         attention_mask = pad_to_max_length([input.attention_mask for input in inputs], pad_value=0, pad_side="left")
-        input_ids = pad_to_max_length([input.input_ids for input in inputs], pad_value=0, pad_side="left")
+        input_ids = pad_to_max_length([input.input_ids for input in inputs], pad_value=pad_token_id, pad_side="left")
         position_ids = pad_to_max_length([input.position_ids for input in inputs], pad_value=0, pad_side="left")
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
@@ -855,7 +858,11 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            # Only update if lengths match (non-SUPO mode or no trajectory splitting)
+            # In SUPO mode with trajectory splitting, fields like reward_model are passed via extra_fields
+            input_len = len(next(iter(input_non_tensor_batch.values()))) if input_non_tensor_batch else 0
+            if input_len == len(inputs):
+                non_tensor_batch.update(input_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
@@ -884,6 +891,9 @@ class AgentLoopWorker:
             "traj_idx",
             "is_final",
             "overlong",
+            "is_padding",  # SUPO: for marker-based unpad
+            "reward_model",  # SUPO: for reward calculation (contains ground_truth)
+            "data_source",  # SUPO: for metrics
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
@@ -1091,57 +1101,36 @@ class AgentLoopManager:
     def _align_dataproto_shapes(self, outputs: list) -> list:
         """SUPO: Align tensor shapes across different DataProto outputs from different workers."""
         import torch
-        
-        # 找出每个tensor key的全局最大长度
-        all_keys = set()
-        for output in outputs:
-            if output.batch is not None:
-                all_keys.update(output.batch.keys())
-        
-        # 对于需要padding的key，计算全局最大长度
-        # 左padding的key（prompt相关）
+        import torch.nn.functional as F
+
         left_pad_keys = {"prompts", "input_ids", "attention_mask", "position_ids"}
-        # 右padding的key（response相关）  
-        right_pad_keys = {"responses", "response_mask", "rollout_log_probs"}
-        
+
+        # 计算每个 2D+ tensor key 的全局最大长度
         global_max_lens = {}
-        for key in all_keys:
-            max_len = 0
-            for output in outputs:
-                if output.batch is not None and key in output.batch.keys():
-                    tensor = output.batch[key]
-                    if tensor.dim() >= 2:
-                        max_len = max(max_len, tensor.size(-1))
-            if max_len > 0:
-                global_max_lens[key] = max_len
-        
-        # Padding每个output到全局最大长度
         for output in outputs:
             if output.batch is None:
                 continue
-            for key in list(output.batch.keys()):
-                if key not in global_max_lens:
+            for key in output.batch.keys():
+                tensor = output.batch[key]
+                if tensor.dim() >= 2:
+                    global_max_lens[key] = max(global_max_lens.get(key, 0), tensor.size(-1))
+
+        # Padding 每个 output 到全局最大长度
+        for output in outputs:
+            if output.batch is None:
+                continue
+            for key, target_len in global_max_lens.items():
+                if key not in output.batch:
                     continue
                 tensor = output.batch[key]
                 if tensor.dim() < 2:
                     continue
-                target_len = global_max_lens[key]
-                current_len = tensor.size(-1)
-                if current_len < target_len:
-                    pad_size = target_len - current_len
-                    if key in left_pad_keys:
-                        # 左padding
-                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
-                        output.batch[key] = torch.cat([padding, tensor], dim=-1)
-                    elif key in right_pad_keys:
-                        # 右padding
-                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
-                        output.batch[key] = torch.cat([tensor, padding], dim=-1)
-                    # 其他key默认右padding
-                    else:
-                        padding = torch.zeros((*tensor.shape[:-1], pad_size), dtype=tensor.dtype, device=tensor.device)
-                        output.batch[key] = torch.cat([tensor, padding], dim=-1)
-        
+                pad_size = target_len - tensor.size(-1)
+                if pad_size > 0:
+                    # 左pad: (pad_left, pad_right), 右pad: (0, pad_size)
+                    pad_spec = (pad_size, 0) if key in left_pad_keys else (0, pad_size)
+                    output.batch[key] = F.pad(tensor, pad_spec, value=0)
+
         return outputs
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

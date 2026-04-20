@@ -1,7 +1,7 @@
 #!/bin/bash
 # Multi-turn Search Tool-Calling with SUPO on BrowseComp-Plus
 # SUPO: Summarization augmented Policy Optimization
-# 4 nodes × 8 A100-80GB, Qwen3-32B, Megatron backend, SGLang rollout
+# 4 nodes × 8 H100-80GB, Qwen3-32B, Megatron backend, SGLang rollout
 #
 # SUPO enables handling tasks beyond working_context_length via periodic summarization
 # - working_context_length (L): actual memory constraint per trajectory
@@ -18,7 +18,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG_DIR="${PROJECT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/megatron_supo_run.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec > >(tee "$LOG_FILE") 2>&1
 
 # ---- Environment ----
 VENV_PATH="/root/paddlejob/workspace/env_run/xzj/venv_echo_megatron"
@@ -70,16 +70,16 @@ REF_CP=1
 ROLLOUT_TP=8
 
 # ---- Sequence lengths ----
-MAX_PROMPT_LENGTH=2048
+MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=8192
 
 # ---- SUPO Configuration ----
 # working_context_length: threshold to trigger summarization (set low to test logic)
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to summarize before marking as overlong
-WORKING_CONTEXT_LENGTH=4096  # 调低以便更容易触发摘要，验证逻辑
-MAX_SUMMARY_ROUNDS=7
-MAX_MODEL_LEN=10240  # 和vanilla保持一致
+WORKING_CONTEXT_LENGTH=6144  # 调低以便更容易触发摘要，验证逻辑
+MAX_SUMMARY_ROUNDS=10
+MAX_MODEL_LEN=12230  # 和vanilla保持一致
 
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 
@@ -151,44 +151,6 @@ for i in $(seq 1 1200); do
     sleep 1
 done
 
-# ---- Retrieval server watchdog ----
-RETRIEVER_LOG="${LOG_DIR}/browsecomp_retriever.log"
-RETRIEVER_CMD=("${VENV_PATH}/bin/python3"
-    "$PROJECT_DIR/examples/sglang_multiturn/browsecomp_retrieval_server.py"
-    --mode dense
-    --model /root/paddlejob/workspace/env_run/xzj/models/Qwen3-Embedding-8B
-    --device cpu
-    --corpus_file "${DATA_DIR}/corpus.parquet"
-    --host 0.0.0.0 --port 8000
-    --batch_size 4
-    --dense_cache /root/paddlejob/workspace/env_run/xzj/browsecomp_dense_cache_tevatron.pkl)
-
-(
-    while true; do
-        sleep 30
-        if ! curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
-            echo "[$(date)] [watchdog] Retrieval server unhealthy, restarting..." >> "$RETRIEVER_LOG"
-            fuser -k 8000/tcp 2>/dev/null || true
-            sleep 2
-            setsid "${RETRIEVER_CMD[@]}" >> "$RETRIEVER_LOG" 2>&1 &
-            RETRIEVER_PID=$!
-            echo "[$(date)] [watchdog] Restarted with PID $RETRIEVER_PID" >> "$RETRIEVER_LOG"
-            for j in $(seq 1 120); do
-                if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
-                    echo "[$(date)] [watchdog] Server back online after ${j}s" >> "$RETRIEVER_LOG"
-                    break
-                fi
-                if ! kill -0 $RETRIEVER_PID 2>/dev/null; then
-                    echo "[$(date)] [watchdog] Server crashed during restart" >> "$RETRIEVER_LOG"
-                    break
-                fi
-                sleep 1
-            done
-        fi
-    done
-) &
-WATCHDOG_PID=$!
-echo "[watchdog] Started retrieval server watchdog (PID=$WATCHDOG_PID)"
 
 # ---- Training with SUPO ----
 python3 -m verl.trainer.main_ppo \

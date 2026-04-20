@@ -122,8 +122,19 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
 
-    non_aborted_sequence_score = sequence_score[non_aborted_mask]
-    non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+    # SUPO: filter to final trajectories only for reward/score metrics.
+    # Non-final trajectories have reward=0 by design and would bias metrics downward.
+    is_final = batch.non_tensor_batch.get("is_final", None)
+    if is_final is not None:
+        is_final_tensor = torch.tensor(
+            [bool(f) for f in is_final], dtype=torch.bool, device=non_aborted_mask.device
+        )
+        reward_mask = non_aborted_mask & is_final_tensor
+    else:
+        reward_mask = non_aborted_mask
+
+    non_aborted_sequence_score = sequence_score[reward_mask]
+    non_aborted_sequence_reward = sequence_reward[reward_mask]
 
     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
     score_max = torch.max(non_aborted_sequence_score).detach().item()

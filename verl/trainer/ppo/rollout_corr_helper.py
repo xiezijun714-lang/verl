@@ -866,8 +866,9 @@ def compute_offpolicy_metrics(
     Returns:
         Dictionary of off-policy metrics (without prefix)
     """
-    # Validate that we have at least one valid token
-    assert response_mask.any(), "Expected at least one valid token in response_mask"
+    # Skip if no valid tokens (e.g., SUPO dummy trajectories with response_mask=0)
+    if not response_mask.any():
+        return {}
 
     metrics = {}
 
