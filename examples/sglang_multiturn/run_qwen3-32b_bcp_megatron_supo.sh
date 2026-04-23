@@ -71,15 +71,15 @@ ROLLOUT_TP=8
 
 # ---- Sequence lengths ----
 MAX_PROMPT_LENGTH=2048
-MAX_RESPONSE_LENGTH=14336
+MAX_RESPONSE_LENGTH=10240
 
 # ---- SUPO Configuration ----
 # working_context_length: threshold to trigger summarization (set low to test logic)
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to summarize before marking as overlong
-WORKING_CONTEXT_LENGTH=16384
-MAX_SUMMARY_ROUNDS=3
-MAX_MODEL_LEN=20488
+WORKING_CONTEXT_LENGTH=10240
+MAX_SUMMARY_ROUNDS=5
+MAX_MODEL_LEN=12288
 
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 

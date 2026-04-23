@@ -68,7 +68,7 @@ class MultiTurnConfig(BaseConfig):
 
     # ECHO context compression configuration
     context_compression_method: str = "summary"  # "summary" (SUPO) or "echo_e2e" (ECHO end-to-end selection)
-    selection_instruction: str = "[CONTEXT COMPRESSION] Your context is full. Previous interaction turns:\n{turn_list}\n\nSelect the most relevant turns to keep for solving the task. For each selected turn, provide its index, a relevance score (0.0-1.0), and a brief reason.\nPut your selection inside <selection></selection> tags, one turn per line. Format: INDEX(SCORE): REASON\nDo NOT output answers to the original task. ONLY output the selection tag."
+    selection_instruction: str = "[CONTEXT COMPRESSION] Previous turns:\n{turn_list}\n\nSelect relevant turns inside <selection></selection>, one per line as `turn_N: reason`."
 
 
 @dataclass

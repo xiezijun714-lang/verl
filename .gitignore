@@ -129,4 +129,4 @@ ENV/
 logs
 log
 outputs
-.history
+.historyval_outputs/
