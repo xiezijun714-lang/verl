@@ -395,8 +395,8 @@ def compute_supo_advantage(
         uid_to_rids = defaultdict(set)
 
         for i in range(bs):
-            rid = int(rid_arr[i])
-            uid = int(uid_arr[i])
+            rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
+            uid = uid_arr[i] if isinstance(uid_arr[i], str) else int(uid_arr[i])
             uid_to_rids[uid].add(rid)
             if overlong_arr[i]:
                 rollout_is_overlong.add(rid)
@@ -434,7 +434,7 @@ def compute_supo_advantage(
         # Pass 3: 广播到 token 维度
         advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
         for i in range(bs):
-            rid = int(rid_arr[i])
+            rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             adv = rollout_to_advantage.get(rid, 0.0)
             advantages[i, :] = adv * response_mask[i, :].float()
 

@@ -66,6 +66,10 @@ class MultiTurnConfig(BaseConfig):
     working_context_length: int = 8192  # Working context length threshold L
     summary_instruction: str = "The interaction history is now too long. Please summarize the interaction history. Remember to keep the important information in the history to ensure that you can continue solving the problem. Do not call any function in this turn. Now generate the summary:\n"
 
+    # ECHO context compression configuration
+    context_compression_method: str = "summary"  # "summary" (SUPO) or "echo_e2e" (ECHO end-to-end selection)
+    selection_instruction: str = "[CONTEXT COMPRESSION] Your context is full. Previous interaction turns:\n{turn_list}\n\nSelect the most relevant turns to keep for solving the task. For each selected turn, provide its index, a relevance score (0.0-1.0), and a brief reason.\nPut your selection inside <selection></selection> tags, one turn per line. Format: INDEX(SCORE): REASON\nDo NOT output answers to the original task. ONLY output the selection tag."
+
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):

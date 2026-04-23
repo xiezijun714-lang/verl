@@ -106,15 +106,18 @@ class AgentData:
         # ========== SUPO (Summarization augmented Policy Optimization) 相关字段 ==========
         self.original_messages: list[dict] = []  # 保存原始messages用于摘要后重建prompt
         self.original_prompt_ids: list[int] = []  # 保存原始prompt s_1
-        self.summary_count: int = 0  # 已执行的摘要轮次 I
+        self.summary_count: int = 0  # 已执行的摘要/压缩轮次 I
         self.trajectory_outputs: list[TrajectoryOutput] = []  # 累积的子轨迹输出
-        self.is_summarizing: bool = False  # 当前是否在生成摘要（v_sum ∈ s_t）
+        self.is_summarizing: bool = False  # 当前是否在生成摘要/选择（v_sum ∈ s_t）
         self.overlong: bool = False  # 是否因超长被终止
         # 当前trajectory累积的response（用于保存trajectory）
         self.current_traj_prompt_ids: list[int] = []
         self.accumulated_response_ids: list[int] = []
         self.accumulated_response_mask: list[int] = []
         self.accumulated_logprobs: list[float] = []
+
+        # ========== ECHO: turn-level history for context reconstruction ==========
+        self.turn_history: list[dict] = []  # [{"query": str, "finding": str, "tool_response_text": str}]
 
 
 @register("tool_agent")
@@ -149,10 +152,17 @@ class ToolAgentLoop(AgentLoopBase):
         self.enable_summarization = getattr(self.rollout_config.multi_turn, 'enable_summarization', False)
         self.max_summary_rounds = getattr(self.rollout_config.multi_turn, 'max_summary_rounds', 2)
         self.working_context_length = getattr(self.rollout_config.multi_turn, 'working_context_length', 8192)
+        # context compression method: "summary" (SUPO) or "echo_e2e" (ECHO: actor selects turns)
+        self.context_compression_method = getattr(self.rollout_config.multi_turn, 'context_compression_method', 'summary')
         self.summary_instruction = getattr(
             self.rollout_config.multi_turn, 
             'summary_instruction', 
             "System:\nYou are a helpful agent interacting with a function calling environment to solve user's problem. The interaction history is now too long. Please summarize the interaction history.\n• Remember to keep the important information in the history to ensure that you can continue solving the problem.\n• Do not call any function in this turn.\nNow generate the summary, and put your summary inside tag <summary></summary>.\n"
+        )
+        self.selection_instruction = getattr(
+            self.rollout_config.multi_turn,
+            'selection_instruction',
+            "[CONTEXT COMPRESSION] Your context is full. Previous interaction turns:\n{turn_list}\n\nSelect the most relevant turns to keep for solving the task. For each selected turn, provide its index, a relevance score (0.0-1.0), and a brief reason.\nPut your selection inside <selection></selection> tags, one turn per line. Format: INDEX(SCORE): REASON\nDo NOT output answers to the original task. ONLY output the selection tag."
         )
 
     @rollout_trace_op
@@ -298,6 +308,19 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        # ECHO: 在 system prompt 中注入 sum_last_turn 规则（类似 tool_call 格式说明，只注入一次）
+        if self.enable_summarization and self.context_compression_method == "echo_e2e":
+            sum_instruction = (
+                "\n\n# Response Format\n"
+                "After receiving each tool response, you MUST include a brief summary of the key finding "
+                "from that tool response using <sum_last_turn></sum_last_turn> tags, "
+                "before making your next tool call."
+            )
+            for msg in agent_data.messages:
+                if msg.get("role") == "system":
+                    msg["content"] = msg["content"] + sum_instruction
+                    break
+
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
             tools=self.tool_schemas,
@@ -346,26 +369,52 @@ class ToolAgentLoop(AgentLoopBase):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        # 处理摘要生成阶段 
+        # 处理上下文压缩生成阶段（summary 或 turn selection）
         if self.enable_summarization and agent_data.is_summarizing:
-            # 追加摘要到当前 trajectory
+            # 追加压缩指令+输出到当前 trajectory
             self._append_summary_to_current_trajectory(agent_data, output.log_probs or [])
 
-            # 解码 summary 文本用于构造新 messages
+            # 解码输出文本
             full_output = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
             )
-            summary_text = self._summary_exclude_think(full_output)
 
-            new_messages = [
-                *agent_data.original_messages,  # 包含原始的 system 和 user
-                {"role": "assistant", "content": f"<summary>{summary_text}</summary>"},
-                {"role": "user", "content": "The above is a summary of your previous interaction history. Please continue solving the problem based on this context. You may call tools as needed."},
-            ]
+            compression_ok = True
+            if self.context_compression_method == "echo_e2e":
+                # ECHO: 提取最后一个 turn 的 finding（<sum_last_turn> 格式）
+                if agent_data.turn_history and not agent_data.turn_history[-1].get("finding"):
+                    finding = self._extract_turn_finding(full_output)
+                    if finding:
+                        agent_data.turn_history[-1]["finding"] = finding
+                # 解析选中的 turn indices
+                selected_indices = self._parse_selection_indices(full_output, len(agent_data.turn_history))
+                if selected_indices is None:
+                    compression_ok = False
+                else:
+                    new_messages = self._build_echo_prompt(agent_data, selected_indices)
+            else:
+                # SUPO: 用 summary 文本重构 prompt
+                summary_text = self._summary_exclude_think(full_output)
+                if len(summary_text.strip()) < 10:
+                    logger.warning(f"SUPO: Summary too short ({repr(summary_text[:50])}), compression failed.")
+                    compression_ok = False
+                else:
+                    new_messages = [
+                        *agent_data.original_messages,
+                        {"role": "assistant", "content": f"<summary>{summary_text}</summary>"},
+                        {"role": "user", "content": "The above is a summary of your previous interaction history. Please continue solving the problem based on this context. You may call tools as needed."},
+                    ]
+
+            if not compression_ok:
+                # 压缩输出质量太差，终止
+                agent_data.is_summarizing = False
+                agent_data.overlong = True
+                logger.warning("Context compression output unusable. Terminating.")
+                return AgentState.TERMINATED
 
             new_prompt_ids = await self.apply_chat_template(new_messages, tools=self.tool_schemas)
-            agent_data.prompt_ids = new_prompt_ids  # 必须更新全局 prompt_ids
-            agent_data.messages = new_messages      # 建议也更新 messages 状态
+            agent_data.prompt_ids = new_prompt_ids
+            agent_data.messages = new_messages
             
             agent_data.current_traj_prompt_ids = list(agent_data.prompt_ids)
             # 清空历史累积
@@ -376,6 +425,9 @@ class ToolAgentLoop(AgentLoopBase):
             # 重置标记
             agent_data.is_summarizing = False
             agent_data.summary_count += 1
+            # ECHO: 重建后清空 turn_history，旧 turns 的 finding 已烤进新 prompt 的 [Key Finding]
+            if self.context_compression_method == "echo_e2e":
+                agent_data.turn_history = []
 
             return AgentState.GENERATING
 
@@ -401,6 +453,36 @@ class ToolAgentLoop(AgentLoopBase):
         # Extract tool calls
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
 
+        # 单轮生成被 max_tokens 截断且没有合法 tool_call
+        if output.stop_reason == "length" and not agent_data.tool_calls:
+            if self.enable_summarization and not agent_data.is_summarizing \
+                    and agent_data.summary_count < self.max_summary_rounds \
+                    and len(agent_data.accumulated_response_ids) > 0:
+                # 有历史轮次：回滚当前废 think，保存子轨迹，压缩后继续
+                logger.warning(
+                    f"Single-turn think truncated (length={len(agent_data.response_ids)}), "
+                    f"but has prior turns. Rolling back and compressing."
+                )
+                # 回滚当前轮的 a_t（被截断的 think）
+                a_t_len = len(agent_data.response_ids)
+                if a_t_len > 0:
+                    agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
+                    agent_data.accumulated_response_mask = agent_data.accumulated_response_mask[:-a_t_len]
+                    agent_data.accumulated_logprobs = agent_data.accumulated_logprobs[:-a_t_len]
+                self._save_current_trajectory_without_current_turn(agent_data)
+                if self.context_compression_method == "echo_e2e":
+                    return await self._trigger_echo_selection(agent_data)
+                else:
+                    return await self._trigger_summary(agent_data)
+            else:
+                # 第一轮就超长 / 压缩次数用完 / 已在压缩中 → 直接终止
+                agent_data.overlong = True
+                logger.warning(
+                    f"Single-turn think truncated (length={len(agent_data.response_ids)}), "
+                    f"no prior turns or compression exhausted. Terminating."
+                )
+                return AgentState.TERMINATED
+
         # Handle interaction if needed
         if self.interaction_config_file:
             assistant_message = await self.loop.run_in_executor(
@@ -410,6 +492,28 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.messages.extend(add_messages)
         # Determine next state
         if agent_data.tool_calls:
+            # ECHO: 先提取上一轮 finding（非首轮），再 append 新 turn
+            if self.enable_summarization and self.context_compression_method == "echo_e2e":
+                # 非首轮：从当前完整 response 中提取上一轮的 finding（仅在 finding 为空时填充，避免覆写 selection round 已提取的 finding）
+                if agent_data.turn_history and not agent_data.turn_history[-1].get("finding"):
+                    full_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+                    agent_data.turn_history[-1]["finding"] = self._extract_turn_finding(full_text)
+
+                # 提取纯 query，创建新 turn
+                query_str = ""
+                try:
+                    for tc in agent_data.tool_calls:
+                        args = json.loads(tc.arguments)
+                        if isinstance(args, dict) and "query" in args:
+                            query_str = args["query"]
+                            break
+                except Exception:
+                    query_str = ", ".join(f"{tc.name}({tc.arguments})" for tc in agent_data.tool_calls)[:100]
+                agent_data.turn_history.append({
+                    "query": query_str,
+                    "finding": "",  # 下一轮 think 时填充
+                    "tool_response_text": "",  # tool_response 返回后填充
+                })
             return AgentState.PROCESSING_TOOLS
         elif self.interaction_config_file:
             return AgentState.INTERACTING
@@ -501,7 +605,19 @@ class ToolAgentLoop(AgentLoopBase):
                 remove_system_prompt=True,
             )
 
-        # ========== MODIFIED: 正确的 SUPO 上下文超限检测 ==========
+        # ECHO: 补充当前 turn 的 tool_response 文本
+        if self.enable_summarization and self.context_compression_method == "echo_e2e" and agent_data.turn_history:
+            tool_resp_text = " | ".join(msg.get("content", "") for msg in add_messages)
+            agent_data.turn_history[-1]["tool_response_text"] = tool_resp_text
+
+            # ECHO: 每轮注入精简 hint，引导模型写 <sum_last_turn>
+            if len(agent_data.turn_history) >= 1:
+                hint_msg = [{"role": "user", "content": "Before your next action, briefly summarize the key finding from the most recent tool response in <sum_last_turn></sum_last_turn> tags."}]
+                agent_data.messages.extend(hint_msg)
+                hint_ids = await self.apply_chat_template(hint_msg, remove_system_prompt=True)
+                tool_response_ids = tool_response_ids + hint_ids
+
+        # ========== 上下文超限检测 ==========
         if self.enable_summarization:
             # 总长度 = prompt + 累积response + 当前a_t + 工具结果o_t
             current_total_length = (
@@ -512,13 +628,13 @@ class ToolAgentLoop(AgentLoopBase):
             
             if current_total_length >= self.working_context_length:
                 logger.debug(
-                    f"SUPO: Context overflow detected. "
+                    f"Context overflow detected. "
                     f"total={current_total_length} >= L={self.working_context_length}. "
-                    f"Discarding current turn (a_t, o_t)."
+                    f"method={self.context_compression_method}"
                 )
                 
                 if agent_data.summary_count < self.max_summary_rounds:
-                    # 关键修改：使用 pointer 回滚到 trajectory 起始位置（安全，不受编码长度变化影响）
+                    # 回滚当前 turn 的 a_t
                     a_t_len = len(agent_data.response_ids)
                     if a_t_len > 0:
                         agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
@@ -528,33 +644,18 @@ class ToolAgentLoop(AgentLoopBase):
                     # 保存当前 trajectory（不含当前轮 a_t 和 o_t）
                     self._save_current_trajectory_without_current_turn(agent_data)
                     
-                    # 准备摘要指令
-                    summary_messages = [{"role": "user", "content": self.summary_instruction}]
-                    summary_instruction_ids = await self.apply_chat_template(
-                        summary_messages,
-                        remove_system_prompt=True,
-                    )
-                    agent_data.sum_instruction_ids = summary_instruction_ids
-                    
-                    # 关键修改：设置生成用的 prompt
-                    # 包含：基础prompt + 累积的历史（已移除a_t）+ 摘要指令
-                    agent_data.prompt_ids = (
-                        agent_data.current_traj_prompt_ids + 
-                        agent_data.accumulated_response_ids + 
-                        summary_instruction_ids
-                    )
-                    
-                    # 重置状态
-                    agent_data.response_mask = []
-                    agent_data.response_logprobs = []
-                    agent_data.is_summarizing = True
-                    
-                    logger.debug(f"SUPO: Triggering summarization. summary_count={agent_data.summary_count}")
-                    return AgentState.GENERATING
+                    if self.context_compression_method == "echo_e2e":
+                        # ECHO: 构建 selection prompt，让 actor 选择保留哪些 turns
+                        # 当前 turn 有完整 tool_call + tool_response，保存到 turn_history
+                        # （turn_history[-1] 在 _handle_generating_state 中已添加 tool_call_text，
+                        #  tool_response_text 在上面已补充）
+                        return await self._trigger_echo_selection(agent_data)
+                    else:
+                        # SUPO: 准备摘要指令
+                        return await self._trigger_summary(agent_data)
                 else:
-                    # 达到最大摘要次数
                     agent_data.overlong = True
-                    logger.warning(f"SUPO: Reached max summary rounds. Marking as overlong.")
+                    logger.warning(f"Reached max compression rounds ({self.max_summary_rounds}). Marking overlong.")
                     return AgentState.TERMINATED
                     
 
@@ -684,11 +785,102 @@ class ToolAgentLoop(AgentLoopBase):
         interaction_map = initialize_interactions_from_config(interaction_config_file)
         return interaction_map
 
+    def _extract_turn_finding(self, full_text: str) -> str:
+        """ECHO: 从完整 response 文本中提取 <sum_last_turn> 摘要，三级 fallback。"""
+        # 1. 完整标签（全文搜索，兼容 think 内外）
+        m = re.search(r'<sum_last_turn>(.*?)</sum_last_turn>', full_text, flags=re.DOTALL)
+        if m and m.group(1).strip():
+            return m.group(1).strip()[:300]
+        # 2. 有开标签没闭标签（被截断）
+        m = re.search(r'<sum_last_turn>(.*)', full_text, flags=re.DOTALL)
+        if m and m.group(1).strip():
+            return m.group(1).strip()[:300]
+        # 3. 没写标签：fallback 到 think 内容前 200 字符
+        think_match = re.search(r'<think>(.*?)</think>', full_text, flags=re.DOTALL)
+        if not think_match:
+            think_match = re.search(r'<think>(.*)', full_text, flags=re.DOTALL)
+        if think_match and think_match.group(1).strip():
+            return think_match.group(1).strip()[:200]
+        return ""
+
+    def _parse_selection_indices(self, full_output: str, max_turns: int) -> list[dict] | None:
+        """ECHO: 从 actor 输出中解析选中的 turn indices 和 relevance scores。
+        返回 [{"index": int, "score": float}, ...] 或 None（解析失败）。"""
+        # 去掉 think 块
+        cleaned = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
+        # 优先从 <selection>...</selection> 标签中提取
+        selection_match = re.search(r'<selection>(.*?)</selection>', cleaned, flags=re.DOTALL)
+        if selection_match:
+            content = selection_match.group(1).strip()
+            # 匹配 "index(score): reason" 或 "index(score)" 格式
+            results = []
+            seen = set()
+            for m in re.finditer(r'(\d+)\s*\(\s*([\d.]+)\s*\)', content):
+                idx, score = int(m.group(1)), float(m.group(2))
+                if idx < max_turns and idx not in seen:
+                    results.append({"index": idx, "score": min(score, 1.0)})
+                    seen.add(idx)
+            if results:
+                return sorted(results, key=lambda x: x["index"])
+            # 标签内没匹配到 index(score)，回退到纯数字提取
+            for x in re.findall(r'\d+', content):
+                idx = int(x)
+                if idx < max_turns and idx not in seen:
+                    results.append({"index": idx, "score": 0.5})
+                    seen.add(idx)
+            if results:
+                return sorted(results, key=lambda x: x["index"])
+        # 标签解析失败，回退到全文提取数字
+        results = []
+        seen = set()
+        for x in re.findall(r'\d+', cleaned):
+            idx = int(x)
+            if idx < max_turns and idx not in seen:
+                results.append({"index": idx, "score": 0.5})
+                seen.add(idx)
+        if not results:
+            logger.warning(f"ECHO: No valid indices parsed from output: {repr(cleaned[:200])}")
+            return None
+        return sorted(results, key=lambda x: x["index"])
+
+    def _build_echo_prompt(self, agent_data: AgentData, selected_turns: list[dict]) -> list[dict]:
+        """ECHO: 用选中的 turns 构建新 prompt messages
+        selected_turns: [{"index": int, "score": float}, ...]
+        重构时用 finding 摘要代替完整 tool_response，长度可控。
+        """
+        # 构建选中 turns 的对话历史（按 index 升序，保持时间顺序）
+        selected_messages = []
+        for item in selected_turns:
+            idx = item["index"]
+            if idx < len(agent_data.turn_history):
+                turn = agent_data.turn_history[idx]
+                query = turn.get("query", "")
+                finding = turn.get("finding", "")
+                # assistant message: 用 query 表示做了什么搜索
+                selected_messages.append({"role": "assistant", "content": f'search({{"query": "{query}"}})'})
+                # tool message: 用 finding 摘要代替完整 tool_response
+                if finding:
+                    selected_messages.append({"role": "tool", "content": f"[Key Finding] {finding}"})
+                else:
+                    # finding 为空（首轮或模型未产出），回退到截断的 tool_response
+                    tr_text = turn.get("tool_response_text", "")[:200]
+                    selected_messages.append({"role": "tool", "content": tr_text})
+
+        new_messages = [
+            *agent_data.original_messages,  # system + user
+            *selected_messages,  # 选中的历史 turns（query + finding）
+            {"role": "user", "content": "The above are the most relevant turns from your previous interaction. Please continue solving the problem based on this context. You may call tools as needed."},
+        ]
+        selected_indices = [item["index"] for item in selected_turns]
+        logger.debug(f"ECHO: Reconstructed prompt with turns {selected_indices} out of {len(agent_data.turn_history)}")
+        return new_messages
+
     def _summary_exclude_think(self, full_output):
         """
-        排除full_output中的<think>思考内容</think>
+        排除full_output中的<think>思考内容</think>，提取summary内容。
+        如果提取失败（截断等），对 fallback 内容做长度上限保护。
         """
-                # 1. 去掉 think 块（兼容换行）
+        # 1. 去掉 think 块（兼容换行）
         cleaned = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
 
         # 2. 提取 summary 标签内的纯内容
@@ -696,13 +888,83 @@ class ToolAgentLoop(AgentLoopBase):
         if match:
             summary_content = match.group(1).strip()
         else:
-            # fallback：如果没找到 summary 标签，用清理后的全文
-            summary_content = cleaned
-            logger.warning("SUPO: No <summary> tag found in output")
+            # fallback：尝试提取 <summary> 开标签后的内容（处理截断导致无闭标签的情况）
+            open_match = re.search(r'<summary>(.*)', cleaned, flags=re.DOTALL)
+            if open_match:
+                summary_content = open_match.group(1).strip()
+            else:
+                summary_content = cleaned
+            logger.warning("SUPO: No <summary> tag found in output, using fallback")
+            # 防护：fallback 内容截断到合理长度（避免下一轮 prompt 被左截断）
+            max_summary_chars = 3072
+            if len(summary_content) > max_summary_chars:
+                summary_content = summary_content[:max_summary_chars] + "...(truncated)"
+                logger.warning(f"SUPO: Fallback summary truncated to {max_summary_chars} chars")
 
         return summary_content
 
-    # SUPO support
+    async def _trigger_summary(self, agent_data: AgentData) -> AgentState:
+        """SUPO: 触发 summary generation"""
+        summary_messages = [{"role": "user", "content": self.summary_instruction}]
+        summary_instruction_ids = await self.apply_chat_template(
+            summary_messages, remove_system_prompt=True,
+        )
+        agent_data.sum_instruction_ids = summary_instruction_ids
+        agent_data.prompt_ids = (
+            agent_data.current_traj_prompt_ids +
+            agent_data.accumulated_response_ids +
+            summary_instruction_ids
+        )
+        agent_data.response_mask = []
+        agent_data.response_logprobs = []
+        agent_data.is_summarizing = True
+        logger.debug(f"SUPO: Triggering summarization. summary_count={agent_data.summary_count}")
+        return AgentState.GENERATING
+
+    async def _trigger_echo_selection(self, agent_data: AgentData) -> AgentState:
+        """ECHO: 触发 turn selection generation，让 actor 选择保留哪些 turns"""
+        # 构建 turn 列表描述
+        turn_descriptions = []
+        last_turn_needs_summary = False
+        turns_needing_summary = []  # 收集所有缺 finding 的 turn index
+        for i, turn in enumerate(agent_data.turn_history):
+            query = turn.get("query", "")[:100]
+            finding = turn.get("finding", "")
+            if finding:
+                turn_descriptions.append(f"[Turn {i}]: query=\"{query}\" → finding=\"{finding[:150]}\"")
+            else:
+                turn_descriptions.append(f"[Turn {i}]: query=\"{query}\" → (no summary yet)")
+                turns_needing_summary.append(i)
+        turn_list_str = "\n".join(turn_descriptions)
+
+        instruction = self.selection_instruction.format(turn_list=turn_list_str)
+
+        # 为最后一个缺 finding 的 turn 附上截断的 tool_response，让模型补写 summary
+        if turns_needing_summary:
+            last_idx = turns_needing_summary[-1]
+            t = agent_data.turn_history[last_idx]
+            tr_snippet = t.get("tool_response_text", "")[:1500]
+            instruction += (
+                f"\n\nThe last turn (Turn {last_idx}) has no summary yet. "
+                f"Its tool_response (truncated):\n{tr_snippet}\n\n"
+                f"First, summarize this turn's key finding in <sum_last_turn></sum_last_turn> tags.\n"
+                f"Then, select the most relevant turns in <selection></selection> tags."
+            )
+        # 构建独立 prompt，不带原始对话上下文，避免模型被原始任务格式干扰
+        selection_messages = [{"role": "user", "content": instruction}]
+        selection_instruction_ids = await self.apply_chat_template(
+            selection_messages, remove_system_prompt=False,
+        )
+        agent_data.sum_instruction_ids = selection_instruction_ids  # 复用字段，用于追加到 trajectory
+        # 关键：prompt 只包含选择指令，不拼接原始对话，让模型专注于选 turn
+        agent_data.prompt_ids = selection_instruction_ids
+        agent_data.response_mask = []
+        agent_data.response_logprobs = []
+        agent_data.is_summarizing = True  # 复用 is_summarizing 标记，表示正在做上下文压缩
+        logger.debug(f"ECHO: Triggering turn selection. turns={len(agent_data.turn_history)}, summary_count={agent_data.summary_count}")
+        return AgentState.GENERATING
+
+    # SUPO/ECHO support
     def _save_current_trajectory_without_current_turn(self, agent_data: AgentData):
         """
         SUPO: 保存当前trajectory，此时 accumulated_response_ids 已经移除了当前轮的a_t

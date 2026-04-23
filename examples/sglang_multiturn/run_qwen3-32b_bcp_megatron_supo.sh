@@ -70,18 +70,26 @@ REF_CP=1
 ROLLOUT_TP=8
 
 # ---- Sequence lengths ----
-MAX_PROMPT_LENGTH=4096
-MAX_RESPONSE_LENGTH=8192
+MAX_PROMPT_LENGTH=2048
+MAX_RESPONSE_LENGTH=14336
 
 # ---- SUPO Configuration ----
 # working_context_length: threshold to trigger summarization (set low to test logic)
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to summarize before marking as overlong
-WORKING_CONTEXT_LENGTH=6144  # 调低以便更容易触发摘要，验证逻辑
-MAX_SUMMARY_ROUNDS=10
-MAX_MODEL_LEN=12230  # 和vanilla保持一致
+WORKING_CONTEXT_LENGTH=16384
+MAX_SUMMARY_ROUNDS=3
+MAX_MODEL_LEN=20488
 
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+
+# ---- Sync run script to worker nodes ----
+echo "[sync] Syncing run script to worker nodes ..."
+SCRIPT_FILE="${PROJECT_DIR}/examples/sglang_multiturn/$(basename "$0")"
+for ip in $WORKER_IPS; do
+    timeout 10 scp -o ConnectTimeout=5 "$SCRIPT_FILE" "$ip":"$SCRIPT_FILE" || echo "[sync] WARNING: failed to sync to $ip"
+done
+echo "[sync] Done."
 
 # ---- Ray cluster ----
 echo "[ray] Stopping any existing Ray instances ..."
@@ -217,7 +225,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=${NNODES} \
     trainer.project_name='echo' \
-    trainer.experiment_name='qwen3-32b_bcp_megatron-supo-L8k-S3' \
+    trainer.experiment_name='qwen3-32b_bcp_megatron-supo-w6k-s10' \
     trainer.logger='["console", "wandb"]' \
     trainer.save_freq=-1 \
     trainer.test_freq=2 \
