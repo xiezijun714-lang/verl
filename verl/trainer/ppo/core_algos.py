@@ -365,6 +365,10 @@ def compute_supo_advantage(
     rollout_id: np.ndarray,
     is_final: np.ndarray,
     overlong: np.ndarray,
+    traj_idx: np.ndarray | None = None,
+    echo_selected_traj_indices: np.ndarray | None = None,
+    echo_selected_turn_ids: np.ndarray | None = None,
+    echo_response_turn_ids: np.ndarray | None = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -388,11 +392,38 @@ def compute_supo_advantage(
         uid_arr = np.asarray(index).flatten()
         is_final_arr = np.asarray(is_final).flatten().astype(bool)
         overlong_arr = np.asarray(overlong).flatten().astype(bool)
+        traj_idx_arr = np.asarray(traj_idx).flatten() if traj_idx is not None else None
+        selected_traj_arr = np.asarray(echo_selected_traj_indices, dtype=object).flatten() \
+            if echo_selected_traj_indices is not None else None
+        selected_turn_arr = np.asarray(echo_selected_turn_ids, dtype=object).flatten() \
+            if echo_selected_turn_ids is not None else None
+        response_turn_arr = np.asarray(echo_response_turn_ids, dtype=object).flatten() \
+            if echo_response_turn_ids is not None else None
+        credit_mode = str(getattr(config, "supo_selected_credit_mode", "none") or "none").lower()
+        valid_credit_modes = {"none", "trajectory", "turn", "token"}
+        if credit_mode not in valid_credit_modes:
+            raise ValueError(
+                f"Invalid supo_selected_credit_mode={credit_mode!r}. "
+                f"Expected one of {sorted(valid_credit_modes)}."
+            )
+        selected_bonus = float(getattr(config, "supo_selected_credit_bonus", 0.0) or 0.0)
+        positive_reward_threshold = float(getattr(config, "supo_positive_reward_threshold", 0.0) or 0.0)
 
         # Pass 1: 收集每个 rollout 的 reward 和 overlong 状态
         rollout_to_reward = {}
+        rollout_to_selected_trajs = {}
+        rollout_to_selected_turns = {}
         rollout_is_overlong = set()
         uid_to_rids = defaultdict(set)
+
+        def _to_int_set(value) -> set[int]:
+            if value is None:
+                return set()
+            if isinstance(value, np.ndarray):
+                return {int(v) for v in value.tolist()}
+            if isinstance(value, (list, tuple, set)):
+                return {int(v) for v in value}
+            return {int(value)}
 
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
@@ -402,6 +433,10 @@ def compute_supo_advantage(
                 rollout_is_overlong.add(rid)
             if is_final_arr[i] and not overlong_arr[i]:
                 rollout_to_reward[rid] = scores[i].item()
+                if selected_traj_arr is not None:
+                    rollout_to_selected_trajs[rid] = _to_int_set(selected_traj_arr[i])
+                if selected_turn_arr is not None:
+                    rollout_to_selected_turns[rid] = _to_int_set(selected_turn_arr[i])
 
         # Pass 2: 按 uid 分组计算 GRPO 优势
         rollout_to_advantage = {}
@@ -436,7 +471,43 @@ def compute_supo_advantage(
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             adv = rollout_to_advantage.get(rid, 0.0)
-            advantages[i, :] = adv * response_mask[i, :].float()
+            bonus_vec = torch.zeros_like(response_mask[i, :], dtype=torch.float32)
+
+            if (
+                selected_bonus > 0.0
+                and rollout_to_reward.get(rid, 0.0) > positive_reward_threshold
+                and credit_mode != "none"
+            ):
+                if credit_mode == "trajectory" and traj_idx_arr is not None:
+                    traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
+                    if traj_idx_i in rollout_to_selected_trajs.get(rid, set()):
+                        bonus_vec = response_mask[i, :].float() * selected_bonus
+                elif credit_mode in ("turn", "token") and response_turn_arr is not None:
+                    selected_turns = rollout_to_selected_turns.get(rid, set())
+                    if selected_turns:
+                        turn_ids_raw = response_turn_arr[i]
+                        turn_ids_list = turn_ids_raw.tolist() if isinstance(turn_ids_raw, np.ndarray) else list(turn_ids_raw)
+                        if len(turn_ids_list) < response_mask.shape[1]:
+                            turn_ids_list = turn_ids_list + [-1] * (response_mask.shape[1] - len(turn_ids_list))
+                        turn_ids_tensor = torch.tensor(turn_ids_list[: response_mask.shape[1]], device=response_mask.device)
+                        selected_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
+                        for turn_id in selected_turns:
+                            selected_mask |= turn_ids_tensor.eq(int(turn_id))
+                        selected_mask &= response_mask[i, :].bool()
+
+                        if credit_mode == "turn":
+                            bonus_vec = selected_mask.float() * selected_bonus
+                        else:
+                            counts = defaultdict(int)
+                            for turn_id in selected_turns:
+                                counts[int(turn_id)] = int((turn_ids_tensor.eq(int(turn_id)) & response_mask[i, :].bool()).sum().item())
+                            for turn_id, count in counts.items():
+                                if count <= 0:
+                                    continue
+                                turn_mask = turn_ids_tensor.eq(turn_id) & response_mask[i, :].bool()
+                                bonus_vec = bonus_vec + turn_mask.float() * (selected_bonus / float(count))
+
+            advantages[i, :] = (adv + bonus_vec) * response_mask[i, :].float()
 
         advantages = advantages.to(token_level_rewards.dtype)
         return advantages, advantages

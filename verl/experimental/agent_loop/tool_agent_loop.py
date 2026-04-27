@@ -58,6 +58,7 @@ class TrajectoryOutput:
     response_ids: list[int]
     response_mask: list[int]
     response_logprobs: list[float]
+    response_turn_ids: list[int]
     is_final: bool = False
 
 
@@ -115,9 +116,13 @@ class AgentData:
         self.accumulated_response_ids: list[int] = []
         self.accumulated_response_mask: list[int] = []
         self.accumulated_logprobs: list[float] = []
+        self.accumulated_response_turn_ids: list[int] = []
 
         # ========== ECHO: turn-level history for context reconstruction ==========
-        self.turn_history: list[dict] = []  # [{"query": str, "finding": str, "tool_response_text": str}]
+        self.turn_history: list[dict] = []  # [{"query": str, "finding": str, "source_traj_idx": int, "turn_id": int}]
+        self.current_selected_traj_indices: list[int] = []
+        self.current_selected_turn_ids: list[int] = []
+        self.next_turn_id: int = 0
 
 
 @register("tool_agent")
@@ -239,6 +244,16 @@ class ToolAgentLoop(AgentLoopBase):
             is_padding = kwargs.get("is_padding", False)  # Get is_padding marker for SUPO unpad
             reward_model = kwargs.get("reward_model", {})  # Get reward_model for SUPO (contains ground_truth)
             data_source = kwargs.get("data_source", "unknown")  # Get data_source for metrics
+            final_selected_traj_indices = (
+                sorted(set(agent_data.current_selected_traj_indices))
+                if self.context_compression_method == "echo_e2e"
+                else []
+            )
+            final_selected_turn_ids = (
+                sorted(set(agent_data.current_selected_turn_ids))
+                if self.context_compression_method == "echo_e2e"
+                else []
+            )
             
             for i, traj in enumerate(agent_data.trajectory_outputs):
                 # Truncate prompt and response to fit within max_model_len
@@ -248,6 +263,7 @@ class ToolAgentLoop(AgentLoopBase):
                 truncated_response_ids = traj.response_ids[:self.response_length]
                 truncated_response_mask = traj.response_mask[:self.response_length]
                 truncated_logprobs = traj.response_logprobs[:self.response_length] if traj.response_logprobs else None
+                truncated_response_turn_ids = traj.response_turn_ids[:self.response_length]
                 
                 output = AgentLoopOutput(
                     prompt_ids=truncated_prompt_ids,
@@ -269,6 +285,9 @@ class ToolAgentLoop(AgentLoopBase):
                         "data_source": data_source,  # Pass through for metrics
                         "turn_scores": agent_data.turn_scores,
                         "tool_rewards": agent_data.tool_rewards,
+                        "echo_selected_traj_indices": final_selected_traj_indices if traj.is_final else None,
+                        "echo_selected_turn_ids": final_selected_turn_ids if traj.is_final else None,
+                        "echo_response_turn_ids": truncated_response_turn_ids,
                     },
                 )
                 outputs.append(output)
@@ -426,6 +445,18 @@ class ToolAgentLoop(AgentLoopBase):
 
             new_prompt_ids = await self.apply_chat_template(new_messages, tools=self.tool_schemas)
             if self.context_compression_method == "echo_e2e":
+                agent_data.current_selected_traj_indices = sorted({
+                    agent_data.turn_history[item["index"]].get("source_traj_idx")
+                    for item in selected_indices
+                    if item["index"] < len(agent_data.turn_history)
+                    and agent_data.turn_history[item["index"]].get("source_traj_idx") is not None
+                })
+                agent_data.current_selected_turn_ids = sorted({
+                    agent_data.turn_history[item["index"]].get("turn_id")
+                    for item in selected_indices
+                    if item["index"] < len(agent_data.turn_history)
+                    and agent_data.turn_history[item["index"]].get("turn_id") is not None
+                })
                 if len(new_prompt_ids) > int(self.working_context_length * 0.8):
                     agent_data.is_summarizing = False
                     agent_data.overlong = True
@@ -442,6 +473,7 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.accumulated_response_ids = []
             agent_data.accumulated_response_mask = []
             agent_data.accumulated_logprobs = []
+            agent_data.accumulated_response_turn_ids = []
             
             # 重置标记
             agent_data.is_summarizing = False
@@ -465,6 +497,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.accumulated_response_ids.extend(agent_data.response_ids)
             agent_data.accumulated_response_mask.extend([1] * len(agent_data.response_ids))
             agent_data.accumulated_logprobs.extend(output.log_probs or [0.0] * len(agent_data.response_ids))
+            current_turn_id = agent_data.next_turn_id if self.context_compression_method == "echo_e2e" else -1
+            agent_data.accumulated_response_turn_ids.extend([current_turn_id] * len(agent_data.response_ids))
 
         # 检查终止条件（保持原逻辑）
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
@@ -511,10 +545,18 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
                     agent_data.accumulated_response_mask = agent_data.accumulated_response_mask[:-a_t_len]
                     agent_data.accumulated_logprobs = agent_data.accumulated_logprobs[:-a_t_len]
-                self._save_current_trajectory_without_current_turn(agent_data)
+                    agent_data.accumulated_response_turn_ids = agent_data.accumulated_response_turn_ids[:-a_t_len]
                 if self.context_compression_method == "echo_e2e":
+                    self._save_current_trajectory_without_current_turn(agent_data)
+                    if not self._has_echo_selection_history(agent_data):
+                        agent_data.overlong = True
+                        logger.warning(
+                            "[ECHO] Think truncated before any reusable turn history was formed. Marking overlong."
+                        )
+                        return AgentState.TERMINATED
                     return await self._trigger_echo_selection(agent_data)
                 else:
+                    self._save_current_trajectory_without_current_turn(agent_data)
                     return await self._trigger_summary(agent_data)
             else:
                 # 第一轮就超长 / 压缩次数用完 / 已在压缩中 / 非supo&echo → 直接终止
@@ -628,7 +670,10 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.pending_turn = {
                 "query": query_str,
                 "finding": "",  # 这个 finding 要在下一轮生成后才能提取
+                "source_traj_idx": len(agent_data.trajectory_outputs),
+                "turn_id": agent_data.next_turn_id,
             }
+            agent_data.next_turn_id += 1
             
             hint_msg = {
                 "role": "user",
@@ -694,8 +739,16 @@ class ToolAgentLoop(AgentLoopBase):
                             agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
                             agent_data.accumulated_response_mask = agent_data.accumulated_response_mask[:-a_t_len]
                             agent_data.accumulated_logprobs = agent_data.accumulated_logprobs[:-a_t_len]
+                            agent_data.accumulated_response_turn_ids = agent_data.accumulated_response_turn_ids[:-a_t_len]
                         agent_data.pending_turn = None
                         self._save_current_trajectory_without_current_turn(agent_data)
+                        if not self._has_echo_selection_history(agent_data):
+                            agent_data.overlong = True
+                            logger.warning(
+                                "[ECHO] Context overflow occurred before any reusable turn history was formed. "
+                                "Marking overlong."
+                            )
+                            return AgentState.TERMINATED
                         return await self._trigger_echo_selection(agent_data)
                     else:
                         # SUPO: 回滚当前 turn 的 a_t（保持原逻辑不变）
@@ -729,6 +782,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.accumulated_response_ids.extend(tool_response_ids)
             agent_data.accumulated_response_mask.extend([0] * len(tool_response_ids))  # tool结果mask=0
             agent_data.accumulated_logprobs.extend([0.0] * len(tool_response_ids))
+            tool_turn_id = agent_data.pending_turn["turn_id"] if echo_inject_hint and hasattr(agent_data, "pending_turn") else -1
+            agent_data.accumulated_response_turn_ids.extend([tool_turn_id] * len(tool_response_ids))
 
         agent_data.prompt_ids += tool_response_ids
         agent_data.response_mask += [0] * len(tool_response_ids)
@@ -851,6 +906,10 @@ class ToolAgentLoop(AgentLoopBase):
         # 没写标签：返回空，由 _build_echo_prompt 用截断 tool_response 兜底
         return ""
 
+    def _has_echo_selection_history(self, agent_data: AgentData) -> bool:
+        """Whether ECHO has at least one retained turn that can participate in selection."""
+        return bool(agent_data.turn_history)
+
     def _parse_selection_indices(self, full_output: str, max_turns: int) -> list[dict] | None:
         """ECHO: 从 actor 输出中解析选中的 turn indices。
         返回 [{"index": int, "score": float}, ...] 或 None（解析失败）。"""
@@ -895,7 +954,7 @@ class ToolAgentLoop(AgentLoopBase):
                 turn = agent_data.turn_history[idx]
                 query = turn.get("query", "")
                 finding = turn.get("finding", "")
-                selected_messages.append({"role": "assistant", "content": f'search({{"query": "{query}"}})'})
+                selected_messages.append({"role": "assistant", "content": f"[turn_{idx} Query] {query}"})
                 selected_messages.append({"role": "tool", "content": f"[turn_{idx} Key Finding] {finding}"})
 
         new_messages = [
@@ -999,15 +1058,19 @@ class ToolAgentLoop(AgentLoopBase):
         resp = agent_data.accumulated_response_ids
         mask = agent_data.accumulated_response_mask
         logp = agent_data.accumulated_logprobs
+        turn_ids = agent_data.accumulated_response_turn_ids
         
         # 确保三者同长
-        min_len = min(len(resp), len(mask), len(logp))
+        min_len = min(len(resp), len(mask), len(logp), len(turn_ids))
+        if min_len == 0:
+            return
         
         agent_data.trajectory_outputs.append(TrajectoryOutput(
             prompt_ids=list(agent_data.current_traj_prompt_ids),
             response_ids=list(resp[:min_len]),
             response_mask=list(mask[:min_len]),
             response_logprobs=list(logp[:min_len]),
+            response_turn_ids=list(turn_ids[:min_len]),
             is_final=False,
         ))
         
@@ -1029,10 +1092,12 @@ class ToolAgentLoop(AgentLoopBase):
             last_traj.response_ids.extend(agent_data.sum_instruction_ids)
             last_traj.response_mask.extend([0] * len(agent_data.sum_instruction_ids))
             last_traj.response_logprobs.extend([0.0] * len(agent_data.sum_instruction_ids))
+            last_traj.response_turn_ids.extend([-1] * len(agent_data.sum_instruction_ids))
 
         # 追加摘要内容（mask=1，有梯度）
         last_traj.response_ids.extend(agent_data.response_ids)
         last_traj.response_mask.extend([1] * len(agent_data.response_ids))
+        last_traj.response_turn_ids.extend([-1] * len(agent_data.response_ids))
         resp_len = len(agent_data.response_ids)
         if summary_logprobs:
             last_traj.response_logprobs.extend(summary_logprobs[:resp_len])
@@ -1082,6 +1147,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids=list(agent_data.accumulated_response_ids),
             response_mask=list(agent_data.accumulated_response_mask),
             response_logprobs=list(agent_data.accumulated_logprobs),
+            response_turn_ids=list(agent_data.accumulated_response_turn_ids),
             is_final=True,
         ))
         

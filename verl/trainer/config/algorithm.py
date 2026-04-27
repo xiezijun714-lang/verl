@@ -603,6 +603,9 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    supo_selected_credit_mode: str = "none"
+    supo_selected_credit_bonus: float = 0.0
+    supo_positive_reward_threshold: float = 0.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

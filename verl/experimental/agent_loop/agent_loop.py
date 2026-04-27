@@ -895,6 +895,9 @@ class AgentLoopWorker:
             "traj_idx",
             "is_final",
             "overlong",
+            "echo_selected_traj_indices",
+            "echo_selected_turn_ids",
+            "echo_response_turn_ids",
             "is_padding",  # SUPO: for marker-based unpad
             "reward_model",  # SUPO: for reward calculation (contains ground_truth)
             "data_source",  # SUPO: for metrics

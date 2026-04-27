@@ -219,6 +219,14 @@ def compute_advantage(
                 adv_kwargs["is_final"] = data.non_tensor_batch["is_final"]
             if "overlong" in data.non_tensor_batch:
                 adv_kwargs["overlong"] = data.non_tensor_batch["overlong"]
+            if "traj_idx" in data.non_tensor_batch:
+                adv_kwargs["traj_idx"] = data.non_tensor_batch["traj_idx"]
+            if "echo_selected_traj_indices" in data.non_tensor_batch:
+                adv_kwargs["echo_selected_traj_indices"] = data.non_tensor_batch["echo_selected_traj_indices"]
+            if "echo_selected_turn_ids" in data.non_tensor_batch:
+                adv_kwargs["echo_selected_turn_ids"] = data.non_tensor_batch["echo_selected_turn_ids"]
+            if "echo_response_turn_ids" in data.non_tensor_batch:
+                adv_kwargs["echo_response_turn_ids"] = data.non_tensor_batch["echo_response_turn_ids"]
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
 
         # calculate advantage estimator
