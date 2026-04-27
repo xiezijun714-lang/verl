@@ -77,7 +77,7 @@ MAX_RESPONSE_LENGTH=10240
 # working_context_length: threshold to trigger turn selection
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to compress before marking as overlong
-WORKING_CONTEXT_LENGTH=10240
+WORKING_CONTEXT_LENGTH=8192
 MAX_SUMMARY_ROUNDS=5
 MAX_MODEL_LEN=12288
 
