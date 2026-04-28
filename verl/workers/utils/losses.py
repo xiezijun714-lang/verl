@@ -131,6 +131,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_agg_mode = config.loss_agg_mode
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    if data.get("echo_credit_method", "none") == "traj-turn":
+        loss_mode = "echo_traj_gspo"
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(

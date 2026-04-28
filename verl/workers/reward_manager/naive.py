@@ -59,18 +59,16 @@ class NaiveRewardManager(AbstractRewardManager):
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
 
-            # ========== SUPO: 检查is_final和overlong标记 ==========
-            is_final = data_item.non_tensor_batch.get("is_final", True)  # 默认为True保持兼容性
-            overlong = data_item.non_tensor_batch.get("overlong", False)  # 默认为False
+            # Context-compressed rollouts only score final, non-overlong segments.
+            is_final = data_item.non_tensor_batch.get("is_final", True)
+            overlong = data_item.non_tensor_batch.get("overlong", False)
             
-            # SUPO: overlong的trajectory不计算reward
             if overlong:
                 reward_extra_info["score"].append(0.0)
                 reward_extra_info["is_final"].append(False)
                 reward_extra_info["overlong"].append(True)
                 continue
             
-            # SUPO: 非final的trajectory不计算verifiable reward
             if not is_final:
                 reward_extra_info["score"].append(0.0)
                 reward_extra_info["is_final"].append(False)
@@ -116,7 +114,6 @@ class NaiveRewardManager(AbstractRewardManager):
                 reward = score
                 reward_extra_info["score"].append(reward)
 
-            # SUPO: 记录is_final和overlong信息
             reward_extra_info["is_final"].append(True)
             reward_extra_info["overlong"].append(False)
 

@@ -437,6 +437,7 @@ class MegatronPPOActor(BasePPOActor):
 
         indices = None
         temperature = data.meta_info["temperature"]
+        echo_credit_method = data.meta_info.get("echo_credit_method", "none")
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
             dp_group = mpu.get_data_parallel_group()
@@ -511,6 +512,8 @@ class MegatronPPOActor(BasePPOActor):
                 loss_agg_mode = self.config.loss_agg_mode
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                if echo_credit_method == "traj-turn":
+                    loss_mode = "echo_traj_gspo"
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
 

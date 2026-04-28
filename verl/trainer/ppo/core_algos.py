@@ -340,10 +340,10 @@ def compute_grpo_vectorized_outcome_advantage(
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Vectorized GRPO（outcome-only）:
+    Vectorized GRPO (outcome-only):
       For each group g:
       a_i = \\frac{r_i - \\mu_g}{\\sigma_g} (or without dividing by \\sigma_g),
-      then broadcast the scalar across the token dimension (multiplied by response_mask).。
+      then broadcast the scalar across the token dimension (multiplied by response_mask).
     """
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
@@ -369,47 +369,48 @@ def compute_supo_advantage(
     echo_selected_traj_indices: np.ndarray | None = None,
     echo_selected_turn_ids: np.ndarray | None = None,
     echo_response_turn_ids: np.ndarray | None = None,
+    echo_response_finding_turn_ids: np.ndarray | None = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    SUPO (Summarization augmented Policy Optimization) 优势计算
+    Compute SUPO advantages for context-compressed rollouts.
 
-    核心逻辑：
-    1. 每个rollout可能产生多条trajectory，只有final trajectory有reward
-    2. 按uid (index) 分组计算GRPO风格的优势
-    3. 同一rollout的所有trajectory共享相同的优势值
-    4. overlong的rollout优势为0
+    Each rollout can emit multiple trajectory segments. Only the final segment
+    receives verifiable reward, and all segments from the same rollout share the
+    rollout-level GRPO advantage. Overlong rollouts receive zero advantage.
     """
     with torch.no_grad():
         bs = token_level_rewards.shape[0]
         scores = token_level_rewards.float().sum(dim=-1)
 
-        # 统一转为 Python 标量数组，避免后续重复 .item() 判断
+        # Normalize metadata to flat arrays for rollout-level aggregation.
         rid_arr = np.asarray(rollout_id).flatten()
         uid_arr = np.asarray(index).flatten()
         is_final_arr = np.asarray(is_final).flatten().astype(bool)
         overlong_arr = np.asarray(overlong).flatten().astype(bool)
         traj_idx_arr = np.asarray(traj_idx).flatten() if traj_idx is not None else None
-        selected_traj_arr = np.asarray(echo_selected_traj_indices, dtype=object).flatten() \
+        selected_traj_arr = np.asarray(echo_selected_traj_indices, dtype=object) \
             if echo_selected_traj_indices is not None else None
-        selected_turn_arr = np.asarray(echo_selected_turn_ids, dtype=object).flatten() \
+        selected_turn_arr = np.asarray(echo_selected_turn_ids, dtype=object) \
             if echo_selected_turn_ids is not None else None
-        response_turn_arr = np.asarray(echo_response_turn_ids, dtype=object).flatten() \
+        response_turn_arr = np.asarray(echo_response_turn_ids, dtype=object) \
             if echo_response_turn_ids is not None else None
-        credit_mode = str(getattr(config, "supo_selected_credit_mode", "none") or "none").lower()
-        valid_credit_modes = {"none", "trajectory", "turn", "token"}
+        response_finding_turn_arr = np.asarray(echo_response_finding_turn_ids, dtype=object) \
+            if echo_response_finding_turn_ids is not None else None
+        credit_mode = str(getattr(config, "echo_credit_method", "none") or "none").lower()
+        valid_credit_modes = {"none", "token", "traj", "traj-turn"}
         if credit_mode not in valid_credit_modes:
             raise ValueError(
-                f"Invalid supo_selected_credit_mode={credit_mode!r}. "
+                f"Invalid echo_credit_method={credit_mode!r}. "
                 f"Expected one of {sorted(valid_credit_modes)}."
             )
-        selected_bonus = float(getattr(config, "supo_selected_credit_bonus", 0.0) or 0.0)
-        positive_reward_threshold = float(getattr(config, "supo_positive_reward_threshold", 0.0) or 0.0)
+        selected_bonus = float(getattr(config, "echo_credit_bonus", 0.0) or 0.0)
+        positive_reward_threshold = float(getattr(config, "echo_positive_reward_threshold", 0.0) or 0.0)
 
-        # Pass 1: 收集每个 rollout 的 reward 和 overlong 状态
+        # Pass 1: collect rollout rewards and overlong states.
         rollout_to_reward = {}
         rollout_to_selected_trajs = {}
         rollout_to_selected_turns = {}
@@ -425,6 +426,15 @@ def compute_supo_advantage(
                 return {int(v) for v in value}
             return {int(value)}
 
+        def _to_turn_tensor(value) -> torch.Tensor:
+            if value is None:
+                turn_ids_list = [-1] * response_mask.shape[1]
+            else:
+                turn_ids_list = value.tolist() if isinstance(value, np.ndarray) else list(value)
+                if len(turn_ids_list) < response_mask.shape[1]:
+                    turn_ids_list = turn_ids_list + [-1] * (response_mask.shape[1] - len(turn_ids_list))
+            return torch.tensor(turn_ids_list[: response_mask.shape[1]], device=response_mask.device)
+
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             uid = uid_arr[i] if isinstance(uid_arr[i], str) else int(uid_arr[i])
@@ -438,12 +448,12 @@ def compute_supo_advantage(
                 if selected_turn_arr is not None:
                     rollout_to_selected_turns[rid] = _to_int_set(selected_turn_arr[i])
 
-        # Pass 2: 按 uid 分组计算 GRPO 优势
+        # Pass 2: compute GRPO-style advantages within each uid group.
         rollout_to_advantage = {}
         for uid, rids in uid_to_rids.items():
             valid_rids = [rid for rid in rids if rid not in rollout_is_overlong]
 
-            # 有效 rollout 不足 2 个，无法计算对比优势
+            # At least two valid rollouts are required for relative advantages.
             if len(valid_rids) <= 1:
                 for rid in rids:
                     rollout_to_advantage[rid] = 0.0
@@ -466,7 +476,7 @@ def compute_supo_advantage(
                     adv = r - mean_r.item()
                 rollout_to_advantage[rid] = adv
 
-        # Pass 3: 广播到 token 维度
+        # Pass 3: broadcast rollout advantages to token positions.
         advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
@@ -475,37 +485,28 @@ def compute_supo_advantage(
 
             if (
                 selected_bonus > 0.0
+                # Gate only the ECHO extra credit; SUPO rollout-level advantage is unchanged.
                 and rollout_to_reward.get(rid, 0.0) > positive_reward_threshold
                 and credit_mode != "none"
             ):
-                if credit_mode == "trajectory" and traj_idx_arr is not None:
+                if is_final_arr[i]:
+                    bonus_vec = response_mask[i, :].float() * selected_bonus
+                elif credit_mode in ("traj", "traj-turn") and traj_idx_arr is not None:
                     traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
                     if traj_idx_i in rollout_to_selected_trajs.get(rid, set()):
                         bonus_vec = response_mask[i, :].float() * selected_bonus
-                elif credit_mode in ("turn", "token") and response_turn_arr is not None:
+                elif credit_mode == "token" and response_turn_arr is not None:
                     selected_turns = rollout_to_selected_turns.get(rid, set())
                     if selected_turns:
-                        turn_ids_raw = response_turn_arr[i]
-                        turn_ids_list = turn_ids_raw.tolist() if isinstance(turn_ids_raw, np.ndarray) else list(turn_ids_raw)
-                        if len(turn_ids_list) < response_mask.shape[1]:
-                            turn_ids_list = turn_ids_list + [-1] * (response_mask.shape[1] - len(turn_ids_list))
-                        turn_ids_tensor = torch.tensor(turn_ids_list[: response_mask.shape[1]], device=response_mask.device)
+                        turn_ids_tensor = _to_turn_tensor(response_turn_arr[i])
+                        finding_turn_ids_tensor = _to_turn_tensor(
+                            response_finding_turn_arr[i] if response_finding_turn_arr is not None else None
+                        )
                         selected_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
                         for turn_id in selected_turns:
-                            selected_mask |= turn_ids_tensor.eq(int(turn_id))
+                            selected_mask |= turn_ids_tensor.eq(int(turn_id)) | finding_turn_ids_tensor.eq(int(turn_id))
                         selected_mask &= response_mask[i, :].bool()
-
-                        if credit_mode == "turn":
-                            bonus_vec = selected_mask.float() * selected_bonus
-                        else:
-                            counts = defaultdict(int)
-                            for turn_id in selected_turns:
-                                counts[int(turn_id)] = int((turn_ids_tensor.eq(int(turn_id)) & response_mask[i, :].bool()).sum().item())
-                            for turn_id, count in counts.items():
-                                if count <= 0:
-                                    continue
-                                turn_mask = turn_ids_tensor.eq(turn_id) & response_mask[i, :].bool()
-                                bonus_vec = bonus_vec + turn_mask.float() * (selected_bonus / float(count))
+                        bonus_vec = selected_mask.float() * selected_bonus
 
             advantages[i, :] = (adv + bonus_vec) * response_mask[i, :].float()
 
@@ -1208,6 +1209,9 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if loss_mask.sum().item() == 0:
+        return loss_mat.sum() * 0.0
+
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
@@ -1645,6 +1649,60 @@ def compute_policy_loss_gspo(
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
 
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("echo_traj_gspo")
+def compute_policy_loss_echo_traj_gspo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute ECHO trajectory-level GSPO loss.
+
+    Each trajectory row uses one geometric-mean importance ratio computed over
+    its valid policy tokens. The same row-level ratio is applied to every valid
+    token in that trajectory.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    negative_approx_kl = log_prob - old_log_prob
+    valid_token_counts = torch.sum(response_mask, dim=-1)
+    safe_token_counts = valid_token_counts.clamp(min=1)
+    log_rho_traj = torch.sum(negative_approx_kl * response_mask, dim=-1) / safe_token_counts
+
+    log_traj_importance_ratio = log_prob - log_prob.detach() + log_rho_traj.detach().unsqueeze(-1)
+    log_traj_importance_ratio = torch.clamp(log_traj_importance_ratio, max=10.0)
+    traj_importance_ratio = torch.exp(log_traj_importance_ratio)
+
+    pg_losses1 = -advantages * traj_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(traj_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
+    )
+
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),

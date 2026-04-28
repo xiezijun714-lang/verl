@@ -530,7 +530,7 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
-        # SUPO: Flatten outputs - 每个样本可能返回多条trajectory
+        # Context compression may return multiple trajectory segments per sample.
         flat_outputs = []
         for output in outputs:
             if isinstance(output, list):
@@ -575,9 +575,7 @@ class AgentLoopWorker:
             )
             output = await agent_loop.run(sampling_params, **kwargs)
             
-            # SUPO: 处理list[AgentLoopOutput]返回
             if isinstance(output, list):
-                # 对每个trajectory调用后处理
                 processed_outputs = []
                 for single_output in output:
                     processed = await self._agent_loop_postprocess(single_output, **kwargs)
@@ -802,8 +800,8 @@ class AgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        # SUPO: 不同trajectory可能有不同的prompt长度，需要先padding到相同长度
-        # Use tokenizer's pad_token_id for padding (not 0, which might be '!' in some tokenizers)
+        # Trajectory segments can have different prompt lengths.
+        # Use the tokenizer pad id instead of 0, which can be a valid token for some tokenizers.
         pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         
         def pad_to_max_length(tensors: list[torch.Tensor], pad_value: int = 0, pad_side: str = "left") -> torch.Tensor:
@@ -822,8 +820,7 @@ class AgentLoopWorker:
                 padded.append(t)
             return torch.cat(padded, dim=0)
         
-        # Convert lists back to tensors and stack them to create a batch.
-        # Use padding for prompt_ids and related tensors to handle SUPO variable lengths
+        # Convert lists back to tensors and stack them into a batch.
         prompt_ids = pad_to_max_length([input.prompt_ids for input in inputs], pad_value=pad_token_id, pad_side="left")
         response_ids = pad_to_max_length([input.response_ids for input in inputs], pad_value=pad_token_id, pad_side="right")
         response_mask = pad_to_max_length([input.response_mask for input in inputs], pad_value=0, pad_side="right")
@@ -862,17 +859,16 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            # Only update if lengths match (non-SUPO mode or no trajectory splitting)
-            # In SUPO mode with trajectory splitting, fields like reward_model are passed via extra_fields
+            # Only update directly when trajectory splitting did not change the batch length.
             input_len = len(next(iter(input_non_tensor_batch.values()))) if input_non_tensor_batch else 0
             if input_len == len(inputs):
                 non_tensor_batch.update(input_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = sorted({key for info in reward_extra_infos for key in info.keys()})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key, None) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -889,7 +885,7 @@ class AgentLoopWorker:
             "min_global_steps",
             "max_global_steps",
             "extras",
-            # SUPO: 添加trajectory相关字段
+            # Context-compression trajectory metadata.
             "uid",
             "rollout_id",
             "traj_idx",
@@ -898,9 +894,10 @@ class AgentLoopWorker:
             "echo_selected_traj_indices",
             "echo_selected_turn_ids",
             "echo_response_turn_ids",
-            "is_padding",  # SUPO: for marker-based unpad
-            "reward_model",  # SUPO: for reward calculation (contains ground_truth)
-            "data_source",  # SUPO: for metrics
+            "echo_response_finding_turn_ids",
+            "is_padding",
+            "reward_model",
+            "data_source",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
@@ -1092,7 +1089,7 @@ class AgentLoopManager:
             ]
         )
         
-        # SUPO: 不同worker可能有不同的max padding长度，需要统一
+        # Different workers may produce different maximum sequence lengths.
         if len(outputs) > 1:
             outputs = self._align_dataproto_shapes(outputs)
         
@@ -1106,13 +1103,13 @@ class AgentLoopManager:
         return output
 
     def _align_dataproto_shapes(self, outputs: list) -> list:
-        """SUPO: Align tensor shapes across different DataProto outputs from different workers."""
+        """Align tensor shapes across DataProto outputs from different workers."""
         import torch
         import torch.nn.functional as F
 
         left_pad_keys = {"prompts", "input_ids", "attention_mask", "position_ids"}
 
-        # 计算每个 2D+ tensor key 的全局最大长度
+        # Compute the global maximum length for each 2D+ tensor key.
         global_max_lens = {}
         for output in outputs:
             if output.batch is None:
@@ -1122,7 +1119,7 @@ class AgentLoopManager:
                 if tensor.dim() >= 2:
                     global_max_lens[key] = max(global_max_lens.get(key, 0), tensor.size(-1))
 
-        # Padding 每个 output 到全局最大长度
+        # Pad each output to the global maximum length.
         for output in outputs:
             if output.batch is None:
                 continue
@@ -1134,7 +1131,7 @@ class AgentLoopManager:
                     continue
                 pad_size = target_len - tensor.size(-1)
                 if pad_size > 0:
-                    # 左pad: (pad_left, pad_right), 右pad: (0, pad_size)
+                    # Left-pad prompt-side tensors and right-pad response-side tensors.
                     pad_spec = (pad_size, 0) if key in left_pad_keys else (0, pad_size)
                     output.batch[key] = F.pad(tensor, pad_spec, value=0)
 

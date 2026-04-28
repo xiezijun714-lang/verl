@@ -601,6 +601,8 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    if micro_batch.meta_info.get("echo_credit_method", "none") == "traj-turn":
+                        loss_mode = "echo_traj_gspo"
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout correction weights if present

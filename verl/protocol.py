@@ -143,7 +143,7 @@ def unpad_dataproto_by_marker(data: "DataProto") -> "DataProto":
 
 def expand_batch_by_uid(original_batch: "DataProto", target_uids: np.ndarray) -> "DataProto":
     """
-    SUPO: Expand original batch to match target_uids length.
+    Expand the original batch to match context-compressed trajectory uids.
 
     For each uid in target_uids, find the corresponding sample in original_batch
     and copy its data. This allows union to work when trajectory count changes.
@@ -176,9 +176,9 @@ def expand_batch_by_uid(original_batch: "DataProto", target_uids: np.ndarray) ->
 
 def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tuple["DataProto", int]:
     """
-    SUPO: 将batch padding到mini_batch_size的整数倍
+    Pad context-compressed trajectories to a multiple of mini_batch_size.
     
-    创建dummy trajectory（response_mask=0）来padding，这样不会贡献梯度。
+    Dummy trajectories use response_mask=0 so they do not contribute gradients.
     
     Args:
         data: DataProto containing trajectories
@@ -192,25 +192,24 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
     
     current_size = len(data)
     if current_size == 0 or current_size % mini_batch_size == 0:
-        # 即使不需要 padding，也要添加 is_dummy 字段
+        # Keep the marker schema stable even when no padding is needed.
         if "is_dummy" not in data.non_tensor_batch:
             data.non_tensor_batch["is_dummy"] = np.zeros(current_size, dtype=bool)
         return data, 0
     
     pad_size = mini_batch_size - (current_size % mini_batch_size)
     
-    # 给原始 data 添加 is_dummy 字段（False）
+    # Mark original data as non-dummy.
     if "is_dummy" not in data.non_tensor_batch:
         data.non_tensor_batch["is_dummy"] = np.zeros(current_size, dtype=bool)
     
-    # 创建dummy trajectories: 复制数据结构但把关键字段置0
-    # 循环取索引直到填满 pad_size 个
+    # Reuse existing rows as structural templates for dummy trajectories.
     import math
     dummy_indices = (list(range(current_size)) * math.ceil(pad_size / current_size))[:pad_size]
     
     dummy_data = data[dummy_indices]
     
-    # 将dummy trajectory的关键字段置0
+    # Zero fields that could otherwise contribute gradients or returns.
     if dummy_data.batch is not None:
         if "response_mask" in dummy_data.batch.keys():
             dummy_data.batch["response_mask"] = torch.zeros_like(dummy_data.batch["response_mask"])
@@ -219,7 +218,7 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
         if "returns" in dummy_data.batch.keys():
             dummy_data.batch["returns"] = torch.zeros_like(dummy_data.batch["returns"])
     
-    # 标记为 dummy
+    # Mark padded rows as dummy trajectories.
     dummy_data.non_tensor_batch["is_dummy"] = np.ones(pad_size, dtype=bool)
     
     padded_data = DataProto.concat([data, dummy_data])
@@ -227,7 +226,7 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
 
 
 def unpad_supo_dummy_trajectories(data: "DataProto", pad_size: int) -> "DataProto":
-    """移除SUPO dummy trajectories"""
+    """Remove dummy trajectory padding."""
     if pad_size > 0:
         return data[:-pad_size]
     return data

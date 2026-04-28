@@ -45,6 +45,16 @@ class NaiveRewardManager(RewardManagerBase):
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:
             extra_info.update(tool_extra_fields.items())
+            if not tool_extra_fields.get("is_final", True) or tool_extra_fields.get("overlong", False):
+                return {
+                    "reward_score": 0.0,
+                    "reward_extra_info": {
+                        "score": 0.0,
+                        "acc": 0.0,
+                        "is_final": bool(tool_extra_fields.get("is_final", True)),
+                        "overlong": bool(tool_extra_fields.get("overlong", False)),
+                    },
+                }
 
         num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})

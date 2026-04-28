@@ -211,7 +211,7 @@ def compute_advantage(
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
-        # SUPO: 添加trajectory相关参数
+        # Add trajectory metadata used by context-compressed rollouts.
         if adv_estimator == "supo" or (hasattr(adv_estimator, 'value') and getattr(adv_estimator, 'value', None) == "supo"):
             if "rollout_id" in data.non_tensor_batch:
                 adv_kwargs["rollout_id"] = data.non_tensor_batch["rollout_id"]
@@ -227,6 +227,8 @@ def compute_advantage(
                 adv_kwargs["echo_selected_turn_ids"] = data.non_tensor_batch["echo_selected_turn_ids"]
             if "echo_response_turn_ids" in data.non_tensor_batch:
                 adv_kwargs["echo_response_turn_ids"] = data.non_tensor_batch["echo_response_turn_ids"]
+            if "echo_response_finding_turn_ids" in data.non_tensor_batch:
+                adv_kwargs["echo_response_finding_turn_ids"] = data.non_tensor_batch["echo_response_finding_turn_ids"]
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
 
         # calculate advantage estimator
@@ -530,14 +532,14 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         
-        # SUPO: separate lists for val_outputs dump (ALL trajectories)
+        # Keep all trajectory segments for validation output dumps.
         dump_inputs = []
         dump_outputs = []
         dump_gts = []
         dump_scores = []
         dump_extra_infos = {}
 
-        # SUPO: collect trajectory split statistics
+        # Collect trajectory split statistics.
         supo_rollout_traj_counts = {}  # rollout_id -> max traj_idx + 1
 
         for test_data in self.val_dataloader:
@@ -553,7 +555,7 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            # Non-SUPO: collect ground_truths here (SUPO collects after union)
+            # Non-compressed rollouts collect ground truths here; compressed rollouts collect them after union.
             if not self._is_supo:
                 ground_truths = [
                     item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -592,11 +594,11 @@ class RayPPOTrainer:
 
             print("validation generation end")
 
-            # SUPO: log rollout output stats (console only)
+            # Log context-compressed rollout stats on the console only.
             if self._is_supo:
                 self._log_supo_val_stats(test_output_gen_batch, test_batch, stage="post-rollout")
 
-            # SUPO: expand batch to match output trajectory count, then union
+            # Expand the batch to match the generated trajectory segment count before union.
             if self._is_supo:
                 if len(test_batch) != len(test_output_gen_batch):
                     target_uids = test_output_gen_batch.non_tensor_batch["uid"]
@@ -618,7 +620,7 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             scores_all = reward_tensor.sum(-1).cpu().tolist()
 
-            # Determine which indices to use for metrics (SUPO: final only, else: all)
+            # Use only final segments for compressed-rollout metrics.
             all_indices = list(range(len(input_texts)))
             if self._is_supo and "is_final" in test_batch.non_tensor_batch:
                 final_indices = np.where(np.array(test_batch.non_tensor_batch["is_final"]))[0].tolist()
@@ -682,7 +684,7 @@ class RayPPOTrainer:
             else:
                 data_source_lst.append([data_sources[i] for i in final_indices])
             
-            # SUPO: collect trajectory split statistics
+            # Collect trajectory split statistics.
             if self._is_supo and "rollout_id" in test_batch.non_tensor_batch and "traj_idx" in test_batch.non_tensor_batch:
                 rollout_ids = test_batch.non_tensor_batch["rollout_id"]
                 traj_idxs = test_batch.non_tensor_batch["traj_idx"]
@@ -693,7 +695,7 @@ class RayPPOTrainer:
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
         
-        # SUPO: compute and log trajectory split statistics
+        # Compute and log trajectory split statistics.
         supo_stats = {}
         if self._is_supo and supo_rollout_traj_counts:
             traj_counts = list(supo_rollout_traj_counts.values())
@@ -1300,6 +1302,7 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        batch.meta_info["echo_credit_method"] = self.config.algorithm.get("echo_credit_method", "none")
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1492,7 +1495,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                    # SUPO: expand batch to match gen_batch_output length, then union
+                    # Expand the batch to match generated trajectory segments before union.
                     if self._is_supo and len(batch) != len(gen_batch_output):
                         target_uids = gen_batch_output.non_tensor_batch["uid"]
                         n_pre = len(batch)
@@ -1501,7 +1504,7 @@ class RayPPOTrainer:
                         gen_uids = gen_batch_output.non_tensor_batch.get("uid", [])
                         gen_is_final = gen_batch_output.non_tensor_batch.get("is_final", [])
 
-                    # SUPO: Remove duplicate keys from batch before union
+                    # Remove duplicate metadata keys before union.
                     if self._is_supo:
                         for key in self._SUPO_DUPLICATE_KEYS:
                             if key in batch.non_tensor_batch and key in gen_batch_output.non_tensor_batch:
@@ -1654,7 +1657,7 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # SUPO: dummy trajectory padding
+                        # Pad with dummy trajectory segments for actor mini-batch divisibility.
                         supo_pad_size = 0
                         if self._is_supo:
                             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1667,7 +1670,7 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
                         
-                        # SUPO: 移除dummy trajectories (如果后续还需要用batch)
+                        # Remove dummy trajectory segments after the actor update.
                         if supo_pad_size > 0:
                             batch = unpad_supo_dummy_trajectories(batch, supo_pad_size)
 

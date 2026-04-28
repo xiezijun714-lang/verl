@@ -14,18 +14,22 @@
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 import verl.trainer.ppo.core_algos
+from verl.workers.config import ActorConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_echo_traj_gspo,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
+    compute_supo_advantage,
     get_adv_estimator_fn,
     register_adv_est,
 )
@@ -217,6 +221,142 @@ def _rand_mask(batch_size: int, seq_len: int) -> torch.Tensor:
     if len(rows_without_one) > 0:
         mask[rows_without_one, -1] = 1.0
     return mask
+
+
+def _supo_credit_case(config):
+    token_level_rewards = torch.zeros((4, 5), dtype=torch.float32)
+    token_level_rewards[1, 0] = 1.0
+    token_level_rewards[3, 0] = 1.0
+    response_mask = torch.ones((4, 5), dtype=torch.float32)
+    return compute_supo_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=np.array([0, 0, 0, 0], dtype=object),
+        rollout_id=np.array(["r0", "r0", "r1", "r1"], dtype=object),
+        is_final=np.array([False, True, False, True], dtype=object),
+        overlong=np.array([False, False, False, False], dtype=object),
+        traj_idx=np.array([0, 1, 0, 1], dtype=object),
+        echo_selected_traj_indices=np.array([None, [0], None, []], dtype=object),
+        echo_selected_turn_ids=np.array([None, [1], None, []], dtype=object),
+        echo_response_turn_ids=np.array(
+            [
+                [0, 1, 1, 2, -1],
+                [-1, -1, -1, -1, -1],
+                [0, 1, 1, 2, -1],
+                [-1, -1, -1, -1, -1],
+            ],
+            dtype=object,
+        ),
+        echo_response_finding_turn_ids=np.array(
+            [
+                [-1, -1, -1, 1, -1],
+                [-1, -1, -1, -1, -1],
+                [-1, -1, -1, 1, -1],
+                [-1, -1, -1, -1, -1],
+            ],
+            dtype=object,
+        ),
+        config=config,
+    )[0]
+
+
+def test_supo_echo_credit_method_none_adds_no_extra_bonus():
+    cfg = SimpleNamespace(
+        echo_credit_method="none", echo_credit_bonus=0.2, echo_positive_reward_threshold=0.5
+    )
+    advantages = _supo_credit_case(cfg)
+    assert torch.equal(advantages, torch.zeros_like(advantages))
+
+
+def test_supo_echo_credit_method_token_marks_selected_causal_tokens_and_final_row():
+    cfg = SimpleNamespace(
+        echo_credit_method="token", echo_credit_bonus=0.2, echo_positive_reward_threshold=0.5
+    )
+    advantages = _supo_credit_case(cfg)
+    expected = torch.tensor(
+        [
+            [0.0, 0.2, 0.2, 0.2, 0.0],
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+        ]
+    )
+    assert torch.allclose(advantages, expected)
+
+
+def test_supo_echo_credit_method_traj_marks_selected_trajectory_and_final_row():
+    cfg = SimpleNamespace(
+        echo_credit_method="traj", echo_credit_bonus=0.2, echo_positive_reward_threshold=0.5
+    )
+    advantages = _supo_credit_case(cfg)
+    expected = torch.tensor(
+        [
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+        ]
+    )
+    assert torch.allclose(advantages, expected)
+
+
+def test_supo_echo_credit_method_rejects_invalid_method():
+    cfg = SimpleNamespace(
+        echo_credit_method="trajectory", echo_credit_bonus=0.2, echo_positive_reward_threshold=0.5
+    )
+    with pytest.raises(ValueError, match="Invalid echo_credit_method"):
+        _supo_credit_case(cfg)
+
+
+def test_supo_echo_positive_reward_threshold_gates_only_extra_bonus():
+    cfg = SimpleNamespace(
+        echo_credit_method="traj", echo_credit_bonus=0.2, echo_positive_reward_threshold=1.0
+    )
+    advantages = _supo_credit_case(cfg)
+    assert torch.equal(advantages, torch.zeros_like(advantages))
+
+
+def test_echo_traj_gspo_uses_one_geometric_ratio_per_trajectory():
+    cfg = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size_per_gpu=1,
+        clip_ratio=10.0,
+        clip_ratio_low=10.0,
+        clip_ratio_high=10.0,
+    )
+    old_log_prob = torch.zeros((2, 3), dtype=torch.float32)
+    log_prob = torch.tensor([[0.0, 0.4, 100.0], [0.2, 0.6, 0.8]], dtype=torch.float32)
+    advantages = torch.ones((2, 3), dtype=torch.float32)
+    response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32)
+
+    loss, metrics = compute_policy_loss_echo_traj_gspo(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=cfg,
+    )
+
+    expected_row_losses = torch.tensor([-torch.exp(torch.tensor(0.2)), -torch.exp(torch.tensor(0.53333336))])
+    expected = expected_row_losses.mean()
+    assert torch.allclose(loss, expected, atol=1e-6)
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(0.0)
+
+
+def test_echo_traj_gspo_zero_response_mask_returns_zero_without_nan():
+    cfg = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    zeros = torch.zeros((2, 3), dtype=torch.float32)
+    loss, metrics = compute_policy_loss_echo_traj_gspo(
+        old_log_prob=zeros,
+        log_prob=zeros,
+        advantages=zeros,
+        response_mask=zeros,
+        config=cfg,
+    )
+    assert loss.item() == pytest.approx(0.0)
+    assert not torch.isnan(loss)
+    assert all(np.isfinite(value) for value in metrics.values())
 
 
 @pytest.mark.parametrize(
