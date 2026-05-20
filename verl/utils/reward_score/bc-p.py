@@ -1,4 +1,5 @@
 import logging
+import json
 import re
 import string
 
@@ -15,7 +16,7 @@ def _normalize(text: str) -> str:
 
 
 def _extract_answer(solution_str: str) -> str | None:
-    """Extract answer from 'Exact Answer:' text output (official BC-Plus format)."""
+    """Extract answer from BC-Plus final text or finish(answer=...) calls."""
     pattern = r"Exact Answer\s*:\s*(.+)"
     matches = re.findall(pattern, solution_str, re.DOTALL)
     if matches:
@@ -24,6 +25,31 @@ def _extract_answer(solution_str: str) -> str | None:
         # Truncate at newline to avoid capturing subsequent sections
         answer = answer.split("\n")[0].strip()
         return answer
+
+    # Paper-style tool submission: <tool_call>{"name": "finish", "arguments": ...}</tool_call>
+    tool_calls = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", solution_str, flags=re.DOTALL)
+    for tool_call in tool_calls:
+        try:
+            payload = json.loads(tool_call)
+        except Exception:
+            continue
+        name = payload.get("name") or payload.get("function", {}).get("name")
+        if str(name).lower() != "finish":
+            continue
+        arguments = payload.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                arguments = {}
+        answer = arguments.get("answer") if isinstance(arguments, dict) else None
+        if answer:
+            return str(answer).strip()
+
+    # Fallback for the tool response emitted by FinishTool.
+    matches = re.findall(r"Answer submitted:\s*(.+)", solution_str)
+    if matches:
+        return matches[0].split("|")[0].strip()
     return None
 
 

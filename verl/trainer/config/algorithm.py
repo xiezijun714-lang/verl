@@ -605,6 +605,7 @@ class AlgoConfig(BaseConfig):
     norm_adv_by_std_in_grpo: bool = True
     echo_credit_method: str = "none"
     echo_credit_bonus: float = 0.0
+    echo_credit_penalty_ratio: Optional[float] = None
     echo_positive_reward_threshold: float = 0.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"

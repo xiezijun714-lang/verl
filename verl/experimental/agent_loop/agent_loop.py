@@ -901,6 +901,8 @@ class AgentLoopWorker:
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
+            if key in non_tensor_batch and all(key not in input_item.extra_fields for input_item in inputs):
+                continue
             temp_arr = np.empty(len(inputs), dtype=object)
             temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
             extra_fields[key] = temp_arr
@@ -1092,6 +1094,7 @@ class AgentLoopManager:
         # Different workers may produce different maximum sequence lengths.
         if len(outputs) > 1:
             outputs = self._align_dataproto_shapes(outputs)
+            outputs = self._align_reward_extra_keys(outputs)
         
         output = DataProto.concat(outputs)
 
@@ -1101,6 +1104,38 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    def _align_reward_extra_keys(self, outputs: list[DataProto]) -> list[DataProto]:
+        """Keep reward_extra_keys stable before concatenating worker outputs.
+
+        Different agent-loop workers may see different reward extra fields in a
+        chunk, especially when only final trajectory segments carry reward info.
+        DataProto.concat requires non-metric meta_info to match exactly, so we
+        normalize the key set and add missing non-tensor columns.
+        """
+        reward_extra_keys = sorted(
+            {
+                key
+                for output in outputs
+                for key in output.meta_info.get("reward_extra_keys", [])
+            }
+        )
+        if not reward_extra_keys:
+            return outputs
+
+        for output in outputs:
+            has_rm_scores = output.batch is not None and "rm_scores" in output.batch.keys()
+            if not has_rm_scores and "reward_extra_keys" not in output.meta_info:
+                continue
+
+            output.meta_info["reward_extra_keys"] = reward_extra_keys
+            for key in reward_extra_keys:
+                if key not in output.non_tensor_batch:
+                    values = np.empty(len(output), dtype=object)
+                    values[:] = None
+                    output.non_tensor_batch[key] = values
+
+        return outputs
 
     def _align_dataproto_shapes(self, outputs: list) -> list:
         """Align tensor shapes across DataProto outputs from different workers."""

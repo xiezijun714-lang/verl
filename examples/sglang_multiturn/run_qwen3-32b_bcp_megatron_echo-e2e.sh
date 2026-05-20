@@ -5,7 +5,7 @@
 #
 # SUPO enables handling tasks beyond working_context_length via periodic summarization
 # - working_context_length (L): actual memory constraint per trajectory
-# - max_model_len: logical max context (can be higher since SUPO manages context)
+# - max_model_len: SGLang physical context window; this model config caps it at 40960
 #
 # Run from project root: bash examples/sglang_multiturn/run_qwen3-32b_bcp_megatron_supo.sh
 
@@ -51,43 +51,97 @@ export RAY_enable_open_telemetry=0
 
 MODEL_PATH="/root/paddlejob/workspace/env_run/xzj/models/Qwen3-32B"
 DATA_DIR="/root/paddlejob/workspace/env_run/xzj/dataset/browsecomp-plus-processed"
+TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.paper.parquet}
+VAL_FILE=${VAL_FILE:-${DATA_DIR}/test.paper.parquet}
 
 # ---- Batch sizes ----
-TRAIN_BATCH_SIZE=32
-N_RESP=8
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+N_RESP=${N_RESP:-8}
 
 # ---- Parallelism ----
-ACTOR_TP=8
-ACTOR_PP=4
+ACTOR_TP=${ACTOR_TP:-8}
+ACTOR_PP=${ACTOR_PP:-2}
 ACTOR_VPP=null
-ACTOR_CP=1
+ACTOR_CP=${ACTOR_CP:-2}
 
-REF_TP=8
-REF_PP=4
+REF_TP=${REF_TP:-8}
+REF_PP=${REF_PP:-2}
 REF_VPP=null
-REF_CP=1
+REF_CP=${REF_CP:-2}
 
-ROLLOUT_TP=8
+ROLLOUT_TP=${ROLLOUT_TP:-8}
 
 # ---- Sequence lengths ----
-MAX_PROMPT_LENGTH=2048
-MAX_RESPONSE_LENGTH=10240
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-32768}
+MAX_TOOL_RESPONSE_LENGTH=${MAX_TOOL_RESPONSE_LENGTH:-16000}
+MAX_PARALLEL_CALLS=${MAX_PARALLEL_CALLS:-5}
 
 # ---- ECHO Configuration ----
-# working_context_length: threshold to trigger turn selection
+# working_context_length: single-segment threshold to trigger turn selection
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to compress before marking as overlong
-WORKING_CONTEXT_LENGTH=8192
-MAX_SUMMARY_ROUNDS=5
-MAX_MODEL_LEN=12288
+WORKING_CONTEXT_LENGTH=${WORKING_CONTEXT_LENGTH:-32768}
+ECHO_RECENT_TURNS=${ECHO_RECENT_TURNS:-3}
+MAX_SUMMARY_ROUNDS=${MAX_SUMMARY_ROUNDS:-5}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
+
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.35}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
+SGLANG_CHUNKED_PREFILL_SIZE=${SGLANG_CHUNKED_PREFILL_SIZE:-8192}
+SGLANG_MAX_PREFILL_TOKENS=${SGLANG_MAX_PREFILL_TOKENS:-32768}
+BCP_SUMMARY_INSTRUCTION=${BCP_SUMMARY_INSTRUCTION:-$'System:\nYour operational context is full. Generate a concise summary by populating the template below.\nThis summary will be your sole context for continuing this task. Be brief but ensure all critical data is present.\n\nRules:\n- Output exactly one <summary>...</summary> block.\n- Do not call any function/tool in this turn.\n- Do not include <think>, tool calls, markdown fences, or text outside the summary tags.\n\n<summary>\nMission Objective:\n- Original query: [State the user verbatim query.]\n- Verification checklist:\n  - [VERIFIED/PENDING]: [Checklist item]\n\nKey Findings:\n- Sources:\n  - [Critical verified fact with source docid]\n- Discrepancies:\n  - [Conflicting information or uncertainty]\n\nTactical Plan:\n- Promising leads:\n  - [Best remaining keywords, sources, or angles]\n- Known dead ends:\n  - [Queries or sources that proved useless]\n- Immediate next action:\n  - [Exact tool call or query to execute next]\n</summary>'}
 
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+ACTOR_TOKEN_BUDGET_PER_GPU=$(((TOKEN_BUDGET + ACTOR_CP - 1) / ACTOR_CP))
+REF_TOKEN_BUDGET_PER_GPU=$(((TOKEN_BUDGET + REF_CP - 1) / REF_CP))
 
-# ---- Sync run script to worker nodes ----
-echo "[sync] Syncing run script to worker nodes ..."
+TOTAL_GPUS=$((NNODES * 8))
+ACTOR_MODEL_PARALLEL_SIZE=$((ACTOR_TP * ACTOR_PP * ACTOR_CP))
+REF_MODEL_PARALLEL_SIZE=$((REF_TP * REF_PP * REF_CP))
+if [ "$ACTOR_MODEL_PARALLEL_SIZE" -ne "$TOTAL_GPUS" ]; then
+    echo "[config] ERROR: ACTOR_TP*ACTOR_PP*ACTOR_CP=${ACTOR_MODEL_PARALLEL_SIZE}, expected ${TOTAL_GPUS}."
+    exit 1
+fi
+if [ "$REF_MODEL_PARALLEL_SIZE" -ne "$TOTAL_GPUS" ]; then
+    echo "[config] ERROR: REF_TP*REF_PP*REF_CP=${REF_MODEL_PARALLEL_SIZE}, expected ${TOTAL_GPUS}."
+    exit 1
+fi
+if [ "$TOKEN_BUDGET" -ge "$MAX_MODEL_LEN" ]; then
+    echo "[config] ERROR: MAX_PROMPT_LENGTH+MAX_RESPONSE_LENGTH=${TOKEN_BUDGET} must be < MAX_MODEL_LEN=${MAX_MODEL_LEN}."
+    exit 1
+fi
+if [ "$MAX_MODEL_LEN" -gt 40960 ]; then
+    echo "[config] ERROR: MAX_MODEL_LEN=${MAX_MODEL_LEN} exceeds local Qwen3-32B max_position_embeddings=40960."
+    exit 1
+fi
+
+echo "[config] context: prompt=${MAX_PROMPT_LENGTH}, response=${MAX_RESPONSE_LENGTH}, working=${WORKING_CONTEXT_LENGTH}, max_model=${MAX_MODEL_LEN}"
+echo "[config] summary: max_summary_rounds=${MAX_SUMMARY_ROUNDS}, effective_context=$((WORKING_CONTEXT_LENGTH * (MAX_SUMMARY_ROUNDS + 1)))"
+echo "[config] parallel: actor TP/PP/CP=${ACTOR_TP}/${ACTOR_PP}/${ACTOR_CP}, ref TP/PP/CP=${REF_TP}/${REF_PP}/${REF_CP}, rollout TP=${ROLLOUT_TP}"
+echo "[config] token budget per GPU: actor=${ACTOR_TOKEN_BUDGET_PER_GPU}, ref=${REF_TOKEN_BUDGET_PER_GPU}"
+
+# ---- Sync run script and critical files to worker nodes ----
+echo "[sync] Syncing run script and BCP integration files to worker nodes ..."
 SCRIPT_FILE="${PROJECT_DIR}/examples/sglang_multiturn/$(basename "$0")"
+SYNC_FILES=(
+    "$SCRIPT_FILE"
+    "${PROJECT_DIR}/examples/sglang_multiturn/config/bcp_multiturn_megatron_grpo.yaml"
+    "${PROJECT_DIR}/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml"
+    "${PROJECT_DIR}/verl/experimental/agent_loop/agent_loop.py"
+    "${PROJECT_DIR}/verl/experimental/agent_loop/tool_agent_loop.py"
+    "${PROJECT_DIR}/verl/trainer/ppo/core_algos.py"
+    "${PROJECT_DIR}/verl/tools/search_tool.py"
+    "${PROJECT_DIR}/verl/tools/open_page_tool.py"
+    "${PROJECT_DIR}/verl/tools/finish_tool.py"
+    "${PROJECT_DIR}/verl/tools/utils/search_r1_like_utils.py"
+    "${PROJECT_DIR}/verl/utils/reward_score/bc-p.py"
+    "${PROJECT_DIR}/verl/utils/reward_score/bc_p_llm_judge.py"
+)
 for ip in $WORKER_IPS; do
-    timeout 10 scp -o ConnectTimeout=5 "$SCRIPT_FILE" "$ip":"$SCRIPT_FILE" || echo "[sync] WARNING: failed to sync to $ip"
+    for file in "${SYNC_FILES[@]}"; do
+        timeout 10 scp -o ConnectTimeout=5 "$file" "$ip":"$file" || echo "[sync] WARNING: failed to sync $file to $ip"
+    done
 done
 echo "[sync] Done."
 
@@ -171,8 +225,9 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=False \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.enable_thinking=True \
-    data.train_files=${DATA_DIR}/train.parquet \
-    data.val_files=${DATA_DIR}/test.parquet \
+    +data.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml" \
+    data.train_files=${TRAIN_FILE} \
+    data.val_files=${VAL_FILE} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -180,55 +235,66 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_decay_style=constant \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${TOKEN_BUDGET} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ACTOR_TOKEN_BUDGET_PER_GPU} \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.clip_ratio=0.28 \
+    actor_rollout_ref.actor.clip_ratio_low=0.20 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${ACTOR_TP} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${ACTOR_PP} \
     actor_rollout_ref.actor.megatron.virtual_pipeline_model_parallel_size=${ACTOR_VPP} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${ACTOR_CP} \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
     actor_rollout_ref.actor.megatron.optimizer_offload=True \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${TOKEN_BUDGET} \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ACTOR_TOKEN_BUDGET_PER_GPU} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP} \
     actor_rollout_ref.rollout.n=${N_RESP} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.2 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION} \
     actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN} \
+    actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS} \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.context_length=${MAX_MODEL_LEN} \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=${SGLANG_CHUNKED_PREFILL_SIZE} \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.max_prefill_tokens=${SGLANG_MAX_PREFILL_TOKENS} \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.multi_turn.enable=true \
-    actor_rollout_ref.rollout.multi_turn.max_tool_response_length=999999 \
+    actor_rollout_ref.rollout.multi_turn.max_parallel_calls=${MAX_PARALLEL_CALLS} \
+    actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml" \
     +actor_rollout_ref.rollout.multi_turn.context_compression_method=echo_e2e \
     +actor_rollout_ref.rollout.multi_turn.enable_summarization=True \
     +actor_rollout_ref.rollout.multi_turn.max_summary_rounds=${MAX_SUMMARY_ROUNDS} \
     +actor_rollout_ref.rollout.multi_turn.working_context_length=${WORKING_CONTEXT_LENGTH} \
+    +actor_rollout_ref.rollout.multi_turn.summary_instruction="'${BCP_SUMMARY_INSTRUCTION}'" \
+    +actor_rollout_ref.rollout.multi_turn.echo_recent_turns=${ECHO_RECENT_TURNS} \
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${TOKEN_BUDGET} \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${REF_TOKEN_BUDGET_PER_GPU} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${REF_TP} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${REF_PP} \
     actor_rollout_ref.ref.megatron.virtual_pipeline_model_parallel_size=${REF_VPP} \
     actor_rollout_ref.ref.megatron.context_parallel_size=${REF_CP} \
     actor_rollout_ref.ref.megatron.param_offload=True \
     algorithm.use_kl_in_reward=False \
-    reward.custom_reward_function.path="$PROJECT_DIR/verl/utils/reward_score/bc-p.py" \
+    +reward.custom_reward_function.path="$PROJECT_DIR/verl/utils/reward_score/bc_p_llm_judge.py" \
     reward.custom_reward_function.name=compute_score \
     trainer.critic_warmup=0 \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=${NNODES} \
     trainer.project_name='echo' \
-    trainer.experiment_name='qwen3-32b_bcp_megatron-echo-e2e-w8k-s7' \
+    trainer.experiment_name='qwen3-32b_bcp_megatron-echo-e2e-32k-s5' \
+    trainer.default_local_dir="${CKPT_DIR:-${PROJECT_DIR}/ckpt}/qwen3-32b_bcp_megatron-echo-e2e-32k-s5" \
     trainer.logger='["console", "wandb"]' \
-    trainer.save_freq=-1 \
+    trainer.save_freq=${SAVE_FREQ:-100} \
     trainer.test_freq=2 \
     trainer.total_epochs=5 \
     +trainer.master_port_range='[31000,32000]' \

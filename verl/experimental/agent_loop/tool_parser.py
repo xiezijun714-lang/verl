@@ -14,6 +14,7 @@
 import json
 import logging
 import os
+import ast
 from abc import ABC, abstractmethod
 
 import regex
@@ -104,6 +105,234 @@ class HermesToolParser(ToolParser):
         content = self.tool_call_regex.sub("", text)
 
         return content, function_calls
+
+
+@ToolParser.register("codegym_fc")
+class CodeGymFunctionCallParser(ToolParser):
+    """Parser for CodeGym function-call envelopes.
+
+    CodeGym prompts ask the model to emit a JSON list inside
+    <|FunctionCallBegin|>...<|FunctionCallEnd|>. The list is expected to
+    contain one function-call dict with "name" and "parameters" fields.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        super().__init__(tokenizer)
+        self.tool_call_regex = regex.compile(
+            r"<\|FunctionCallBegin\|>(.*?)<\|FunctionCallEnd\|>"
+            r"|<function[_\s-]?call>(.*?)</function[_\s-]?call>"
+            r"|<tool_call>(.*?)</tool_call>",
+            regex.DOTALL | regex.IGNORECASE,
+        )
+
+    @rollout_trace_op
+    async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+        text = self.tokenizer.decode(responses_ids)
+        matches = [next(group for group in match.groups() if group is not None) for match in self.tool_call_regex.finditer(text)]
+        if not matches:
+            return text, []
+
+        function_calls = []
+        for match in matches:
+            try:
+                calls = self._load_calls(match)
+                function_calls.extend(calls[:1])
+            except Exception as e:
+                snippet = match.strip().replace("\n", "\\n")[:300]
+                logger.error(f"Failed to decode CodeGym function call: {e}; payload={snippet!r}")
+
+        content = self.tool_call_regex.sub("", text)
+        return content, function_calls
+
+    def _load_calls(self, text: str) -> list[FunctionCall]:
+        try:
+            payload = self._parse_payload(text)
+            if isinstance(payload, list):
+                raw_calls = payload
+            elif isinstance(payload, dict):
+                raw_calls = [payload]
+            else:
+                raw_calls = []
+
+            calls = []
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, dict):
+                    continue
+                name = raw_call.get("name")
+                if not name:
+                    continue
+                arguments = raw_call.get("parameters", raw_call.get("arguments", {}))
+                if arguments is None:
+                    arguments = {}
+                calls.append(
+                    FunctionCall(name=str(name), arguments=json.dumps(self._jsonable(arguments), ensure_ascii=False))
+                )
+            if calls:
+                return calls
+        except Exception:
+            pass
+
+        fallback = self._extract_call_by_regex(text)
+        if fallback is not None:
+            return [fallback]
+        raise ValueError("no valid CodeGym function call found")
+
+    def _parse_payload(self, text: str):
+        payload = text.strip()
+        payload = regex.sub(r"^```(?:json)?\s*|\s*```$", "", payload, flags=regex.IGNORECASE).strip()
+        payload = regex.sub(r"^\s*json\s*", "", payload, flags=regex.IGNORECASE).strip()
+
+        candidates = [payload]
+        fixed = payload
+        fixed = regex.sub(r'("name"\s*:\s*"[^"]+")\s+("(?:parameters|arguments)"\s*:)', r"\1, \2", fixed)
+        fixed = regex.sub(r"}\s*{", "},{", fixed)
+        if fixed and fixed[0] == "{" and "},{" in fixed:
+            fixed = f"[{fixed}]"
+        if fixed != payload:
+            candidates.append(fixed)
+
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+            try:
+                return ast.literal_eval(
+                    regex.sub(r"\btrue\b", "True", regex.sub(r"\bfalse\b", "False", regex.sub(r"\bnull\b", "None", candidate)))
+                )
+            except Exception:
+                pass
+            try:
+                start = min([idx for idx in (candidate.find("["), candidate.find("{")) if idx >= 0])
+                obj, _ = json.JSONDecoder().raw_decode(candidate[start:])
+                return obj
+            except Exception:
+                pass
+
+        raise ValueError("payload is not valid JSON/Python literal")
+
+    def _extract_call_by_regex(self, text: str) -> FunctionCall | None:
+        name_match = regex.search(r"""["']?name["']?\s*:\s*["']([^"']+)["']""", text)
+        if not name_match:
+            return None
+
+        arguments = {}
+        params_match = regex.search(r"""["']?(?:parameters|arguments)["']?\s*:""", text)
+        if params_match:
+            brace_start = text.find("{", params_match.end())
+            if brace_start >= 0:
+                param_text = self._balanced_object(text, brace_start)
+                if param_text:
+                    try:
+                        arguments = self._parse_payload(param_text)
+                    except Exception:
+                        arguments = {}
+
+        return FunctionCall(
+            name=name_match.group(1),
+            arguments=json.dumps(self._jsonable(arguments), ensure_ascii=False),
+        )
+
+    @classmethod
+    def _jsonable(cls, value):
+        if value is Ellipsis:
+            return []
+        if isinstance(value, dict):
+            return {str(key): cls._jsonable(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._jsonable(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            items = list(value)
+            try:
+                items = sorted(items)
+            except TypeError:
+                pass
+            return [cls._jsonable(item) for item in items]
+        return value
+
+    @staticmethod
+    def _balanced_object(text: str, start: int) -> str | None:
+        depth = 0
+        in_string = False
+        quote = ""
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                continue
+            if ch in ("'", '"'):
+                in_string = True
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
+
+@ToolParser.register("bcp_fc")
+@ToolParser.register("seed_oss")
+class BcpFunctionCallParser(ToolParser):
+    """Parser for BrowseComp-Plus function-call envelopes."""
+
+    def __init__(self, tokenizer) -> None:
+        super().__init__(tokenizer)
+        self.tool_call_regex = regex.compile(
+            r"<seed:tool_call>(.*?)</seed:tool_call>",
+            regex.DOTALL | regex.IGNORECASE,
+        )
+        self.function_regex = regex.compile(
+            r"<\s*function\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>(.*?)</\s*function(?:\s*=\s*[A-Za-z_][A-Za-z0-9_]*)?\s*>",
+            regex.DOTALL | regex.IGNORECASE,
+        )
+        self.parameter_regex = regex.compile(
+            r"<\s*parameter\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>(.*?)</\s*parameter\s*>",
+            regex.DOTALL | regex.IGNORECASE,
+        )
+
+    @rollout_trace_op
+    async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+        text = self.tokenizer.decode(responses_ids)
+        seed_wrapped_matches = self.tool_call_regex.findall(text)
+        parse_blocks = seed_wrapped_matches if seed_wrapped_matches else [text]
+
+        function_calls = []
+        for block in parse_blocks:
+            for fn_name, body in self.function_regex.findall(block):
+                arguments = {}
+                for arg_name, arg_value in self.parameter_regex.findall(body):
+                    arguments[arg_name] = self._coerce_value(arg_value.strip())
+                function_calls.append(
+                    FunctionCall(name=fn_name, arguments=json.dumps(arguments, ensure_ascii=False))
+                )
+
+        if not function_calls:
+            return text, []
+
+        content = self.tool_call_regex.sub("", text)
+        content = self.function_regex.sub("", content)
+        return content, function_calls
+
+    @staticmethod
+    def _coerce_value(value: str):
+        if value == "":
+            return ""
+        try:
+            return json.loads(value)
+        except Exception:
+            pass
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value
 
 
 @ToolParser.register("gpt-oss")

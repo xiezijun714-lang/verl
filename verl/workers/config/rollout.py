@@ -58,17 +58,80 @@ class MultiTurnConfig(BaseConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+    inject_tool_schemas: bool = True
     num_repeat_rollouts: Optional[int] = None
+    codegym_server_host: Optional[str] = None
 
     # SUPO (Summarization augmented Policy Optimization) configuration
     enable_summarization: bool = False  # Enable SUPO summarization mechanism
     max_summary_rounds: int = 2  # Maximum summarization rounds S
     working_context_length: int = 8192  # Working context length threshold L
-    summary_instruction: str = "The interaction history is now too long. Please summarize the interaction history. Remember to keep the important information in the history to ensure that you can continue solving the problem. Do not call any function in this turn. Now generate the summary:\n"
+    summary_max_chars: int = 3072  # Maximum characters retained from generated summaries
+    summary_instruction: str = (
+        "System:\n"
+        "You are a helpful agent interacting with a function calling environment to solve the problem.\n"
+        "The interaction history is now too long. Please summarize the interaction history.\n\n"
+        "Rules:\n"
+        "- Output exactly one <summary>...</summary> block.\n"
+        "- Do not call any function/tool in this turn.\n"
+        "- Do not include <think>, tool calls, markdown fences, or text outside the summary tags.\n"
+        "- Keep the important information needed to continue solving the problem.\n\n"
+        "<summary>\n"
+        "Task Objective:\n"
+        "- Original problem: [State the user problem.]\n\n"
+        "Current State:\n"
+        "- Key facts and constraints:\n"
+        "  - [Important verified fact, constraint, or intermediate result]\n"
+        "- Code or tool outputs:\n"
+        "  - [Important result from previous function/tool calls]\n"
+        "- Errors or failed attempts:\n"
+        "  - [Known dead end, exception, or incorrect approach]\n\n"
+        "Plan:\n"
+        "- Next step:\n"
+        "  - [Exact next action to continue solving the problem]\n"
+        "</summary>"
+    )
 
     # ECHO context compression configuration
-    context_compression_method: str = "summary"  # "summary" (SUPO) or "echo_e2e" (ECHO end-to-end selection)
-    selection_instruction: str = "[CONTEXT COMPRESSION] Previous turns:\n{turn_list}\n\nSelect relevant turns inside <selection></selection>, one per line as `turn_N: reason`."
+    context_compression_method: str = "summary"  # "summary", "truncate", "echo_e2e", or "semantic_selection"
+    selection_instruction: str = (
+        "System:\n"
+        "Your operational context is full. Select prior interaction turns that are necessary to continue solving the task.\n\n"
+        "Rules:\n"
+        "- Output exactly one <selection>...</selection> block.\n"
+        "- Do not call any function/tool in this turn.\n"
+        "- Do not answer the original task.\n"
+        "- Do not include <think>, tool calls, markdown fences, or text outside the selection tags.\n"
+        "- Select only turns that contain reusable evidence, constraints, failed attempts, or the next planned action.\n"
+        "- Prefer older turns that are not already covered by automatically retained recent turns.\n"
+        "- If no older turn is necessary, return an empty <selection></selection> block.\n\n"
+        "Valid turns:\n"
+        "{turn_list}\n\n"
+        "<selection>\n"
+        "[zero or more lines, each formatted as turn_N: reason]\n"
+        "</selection>"
+    )
+    selection_max_turns: int = 8  # Max model-selected turns before automatic recent-turn retention. <=0 disables cap.
+    echo_recent_turns: int = 3  # Always retain the latest K turns in addition to selected turns.
+    sum_last_turn_instruction: str = (
+        "# Turn Summary Requirement\n"
+        "After each tool/function response, before the next tool/function call, write one concise factual summary of that latest response.\n\n"
+        "Rules:\n"
+        "- Output exactly one <sum_last_turn>...</sum_last_turn> block before the next tool/function call.\n"
+        "- Put the block outside <think>; if you use <think>, close </think> before writing <sum_last_turn>.\n"
+        "- Summarize only the latest tool/function response and the useful result it provides.\n"
+        "- Do not include <think>, tool calls, markdown fences, or long raw passages inside the tags.\n"
+        "- Keep it short: one sentence or at most 300 characters.\n"
+        "- If the tool/function response failed or was empty, state the failure briefly.\n"
+        "- After closing </sum_last_turn>, continue with the next tool/function call only if needed.\n\n"
+        "<sum_last_turn>[one concise factual sentence]</sum_last_turn>"
+    )
+    sum_last_turn_hint: str = (
+        "Before the next tool/function call, output exactly one <sum_last_turn>...</sum_last_turn> block "
+        "outside <think>, summarizing only the latest tool/function response. Keep it one sentence or at most "
+        "300 characters; do not include <think>, raw long passages, or tool calls inside the tags."
+    )
+    sum_last_turn_max_chars: int = 300
 
 
 @dataclass

@@ -132,6 +132,7 @@ class SupportedModel(Enum):
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
     GPT_OSS = "GptOssForCausalLM"
     MiMO = "MiMoForCausalLM"
+    SEED_OSS = "SeedOssForCausalLM"
 
 
 # Registry for model configuration converters
@@ -147,6 +148,7 @@ MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig
     SupportedModel.QWEN3_MOE: hf_to_mcore_config_qwen3moe,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: hf_to_mcore_config_dense,
     SupportedModel.LLAMA_TOKEN_CLASSIFICATION: hf_to_mcore_config_dense,
+    SupportedModel.SEED_OSS: hf_to_mcore_config_dense,
 }
 
 # Registry for model initializers
@@ -162,6 +164,7 @@ MODEL_INITIALIZER_REGISTRY: dict[SupportedModel, type[BaseModelInitializer]] = {
     SupportedModel.QWEN3_MOE: Qwen3MoEModel,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: DenseModel,
     SupportedModel.LLAMA_TOKEN_CLASSIFICATION: DenseModel,
+    SupportedModel.SEED_OSS: DenseModel,
 }
 
 # Registry for model forward functions
@@ -182,6 +185,7 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA_TOKEN_CLASSIFICATION: model_forward_gen(),
     SupportedModel.GPT_OSS: model_forward_gen(),
     SupportedModel.MiMO: model_forward_gen(),
+    SupportedModel.SEED_OSS: model_forward_gen(),
 }
 
 # Registry for model forward functions
@@ -202,6 +206,7 @@ MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA_TOKEN_CLASSIFICATION: gptmodel_forward_no_padding,
     SupportedModel.GPT_OSS: gptmodel_forward_no_padding,
     SupportedModel.MiMO: gptmodel_forward_no_padding,
+    SupportedModel.SEED_OSS: gptmodel_forward_no_padding,
 }
 
 # Registry for model forward functions
@@ -220,6 +225,7 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.GLM4_MOE: fused_forward_model_gen(),
     SupportedModel.GPT_OSS: fused_forward_model_gen(),
     SupportedModel.MiMO: fused_forward_model_gen(),
+    SupportedModel.SEED_OSS: fused_forward_model_gen(),
 }
 
 # Registry for model weight converters
@@ -234,6 +240,7 @@ MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
     SupportedModel.QWEN2_5_VL: McoreToHFWeightConverterQwen2_5_VL,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: McoreToHFWeightConverterDense,
     SupportedModel.LLAMA_TOKEN_CLASSIFICATION: McoreToHFWeightConverterDense,
+    SupportedModel.SEED_OSS: McoreToHFWeightConverterDense,
 }
 
 

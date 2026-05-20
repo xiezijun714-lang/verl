@@ -407,6 +407,11 @@ def compute_supo_advantage(
                 f"Invalid echo_credit_method={credit_mode!r}. "
                 f"Expected one of {sorted(valid_credit_modes)}."
             )
+        penalty_ratio_config = getattr(config, "echo_credit_penalty_ratio", None)
+        use_penalty_ratio = penalty_ratio_config is not None and credit_mode != "none"
+        penalty_ratio = float(penalty_ratio_config) if use_penalty_ratio else 1.0
+        if not 0.0 <= penalty_ratio <= 1.0:
+            raise ValueError(f"echo_credit_penalty_ratio must be in [0, 1], got {penalty_ratio}")
         selected_bonus = float(getattr(config, "echo_credit_bonus", 0.0) or 0.0)
         positive_reward_threshold = float(getattr(config, "echo_positive_reward_threshold", 0.0) or 0.0)
 
@@ -453,8 +458,33 @@ def compute_supo_advantage(
         for uid, rids in uid_to_rids.items():
             valid_rids = [rid for rid in rids if rid not in rollout_is_overlong]
 
-            # At least two valid rollouts are required for relative advantages.
+            # At least two valid rollouts are required for the masked relative
+            # baseline. If only one rollout survives the overlong mask, use the
+            # full group with overlong rewards as zero for the baseline, while
+            # still assigning zero advantage to overlong rollouts themselves.
             if len(valid_rids) <= 1:
+                if len(rids) > 1 and len(valid_rids) == 1:
+                    group_rewards = torch.tensor(
+                        [
+                            0.0 if rid in rollout_is_overlong else rollout_to_reward.get(rid, 0.0)
+                            for rid in rids
+                        ],
+                        dtype=torch.float32,
+                    )
+                    mean_r = group_rewards.mean()
+                    std_r = group_rewards.std(unbiased=False)
+                    for rid in rids:
+                        if rid in rollout_is_overlong:
+                            rollout_to_advantage[rid] = 0.0
+                            continue
+                        r = rollout_to_reward.get(rid, 0.0)
+                        if norm_adv_by_std_in_grpo:
+                            adv = (r - mean_r.item()) / (std_r.item() + epsilon) if std_r.item() > epsilon else 0.0
+                        else:
+                            adv = r - mean_r.item()
+                        rollout_to_advantage[rid] = adv
+                    continue
+
                 for rid in rids:
                     rollout_to_advantage[rid] = 0.0
                 continue
@@ -482,6 +512,33 @@ def compute_supo_advantage(
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             adv = rollout_to_advantage.get(rid, 0.0)
             bonus_vec = torch.zeros_like(response_mask[i, :], dtype=torch.float32)
+            credit_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
+            rollout_has_credit_target = False
+
+            if credit_mode in ("traj", "traj-turn") and traj_idx_arr is not None:
+                traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
+                selected_trajs = rollout_to_selected_trajs.get(rid, set())
+                rollout_has_credit_target = rollout_has_credit_target or bool(selected_trajs)
+                if traj_idx_i in selected_trajs:
+                    credit_mask |= response_mask[i, :].bool()
+
+            if credit_mode in ("token", "traj-turn") and response_turn_arr is not None:
+                selected_turns = rollout_to_selected_turns.get(rid, set())
+                rollout_has_credit_target = rollout_has_credit_target or bool(selected_turns)
+                if selected_turns:
+                    turn_ids_tensor = _to_turn_tensor(response_turn_arr[i])
+                    finding_turn_ids_tensor = _to_turn_tensor(
+                        response_finding_turn_arr[i] if response_finding_turn_arr is not None else None
+                    )
+                    for turn_id in selected_turns:
+                        credit_mask |= turn_ids_tensor.eq(int(turn_id)) | finding_turn_ids_tensor.eq(int(turn_id))
+                    credit_mask &= response_mask[i, :].bool()
+
+            if use_penalty_ratio and rollout_has_credit_target:
+                weight_vec = torch.full_like(response_mask[i, :], penalty_ratio, dtype=torch.float32)
+                weight_vec[credit_mask] = 1.0
+                advantages[i, :] = adv * response_mask[i, :].float() * weight_vec
+                continue
 
             if (
                 selected_bonus > 0.0
@@ -491,22 +548,8 @@ def compute_supo_advantage(
             ):
                 if is_final_arr[i]:
                     bonus_vec = response_mask[i, :].float() * selected_bonus
-                elif credit_mode in ("traj", "traj-turn") and traj_idx_arr is not None:
-                    traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
-                    if traj_idx_i in rollout_to_selected_trajs.get(rid, set()):
-                        bonus_vec = response_mask[i, :].float() * selected_bonus
-                elif credit_mode == "token" and response_turn_arr is not None:
-                    selected_turns = rollout_to_selected_turns.get(rid, set())
-                    if selected_turns:
-                        turn_ids_tensor = _to_turn_tensor(response_turn_arr[i])
-                        finding_turn_ids_tensor = _to_turn_tensor(
-                            response_finding_turn_arr[i] if response_finding_turn_arr is not None else None
-                        )
-                        selected_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
-                        for turn_id in selected_turns:
-                            selected_mask |= turn_ids_tensor.eq(int(turn_id)) | finding_turn_ids_tensor.eq(int(turn_id))
-                        selected_mask &= response_mask[i, :].bool()
-                        bonus_vec = selected_mask.float() * selected_bonus
+                elif credit_mask.any():
+                    bonus_vec = credit_mask.float() * selected_bonus
 
             advantages[i, :] = (adv + bonus_vec) * response_mask[i, :].float()
 

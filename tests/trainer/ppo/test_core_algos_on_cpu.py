@@ -300,6 +300,57 @@ def test_supo_echo_credit_method_traj_marks_selected_trajectory_and_final_row():
     assert torch.allclose(advantages, expected)
 
 
+def test_supo_echo_credit_penalty_ratio_masks_unselected_tokens():
+    cfg = SimpleNamespace(
+        echo_credit_method="token",
+        echo_credit_bonus=0.0,
+        echo_credit_penalty_ratio=0.0,
+        echo_positive_reward_threshold=0.0,
+    )
+    token_level_rewards = torch.zeros((4, 5), dtype=torch.float32)
+    token_level_rewards[1, 0] = 1.0
+    response_mask = torch.ones((4, 5), dtype=torch.float32)
+    advantages = compute_supo_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=np.array([0, 0, 0, 0], dtype=object),
+        rollout_id=np.array(["r0", "r0", "r1", "r1"], dtype=object),
+        is_final=np.array([False, True, False, True], dtype=object),
+        overlong=np.array([False, False, False, False], dtype=object),
+        traj_idx=np.array([0, 1, 0, 1], dtype=object),
+        echo_selected_traj_indices=np.array([None, [], None, []], dtype=object),
+        echo_selected_turn_ids=np.array([None, [1], None, []], dtype=object),
+        echo_response_turn_ids=np.array(
+            [
+                [0, 1, 1, 2, -1],
+                [-1, -1, -1, -1, -1],
+                [0, 1, 1, 2, -1],
+                [-1, -1, -1, -1, -1],
+            ],
+            dtype=object,
+        ),
+        echo_response_finding_turn_ids=np.array(
+            [
+                [-1, -1, -1, 1, -1],
+                [-1, -1, -1, -1, -1],
+                [-1, -1, -1, 1, -1],
+                [-1, -1, -1, -1, -1],
+            ],
+            dtype=object,
+        ),
+        config=cfg,
+    )[0]
+    expected = torch.tensor(
+        [
+            [0.0, 1.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [-1.0, -1.0, -1.0, -1.0, -1.0],
+            [-1.0, -1.0, -1.0, -1.0, -1.0],
+        ]
+    )
+    assert torch.allclose(advantages, expected, atol=1e-5)
+
+
 def test_supo_echo_credit_method_rejects_invalid_method():
     cfg = SimpleNamespace(
         echo_credit_method="trajectory", echo_credit_bonus=0.2, echo_positive_reward_threshold=0.5

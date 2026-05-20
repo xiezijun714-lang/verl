@@ -13,14 +13,16 @@
 # limitations under the License.
 import asyncio
 import json
-import re
 import logging
 import os
+import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
+import requests
 import torch
 from PIL import Image
 
@@ -41,6 +43,16 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+SEMANTIC_SELECTION_TOPK = 5
+SEMANTIC_SELECTION_RECENT_TURNS = 3
+SEMANTIC_SELECTION_QUERY_UNITS = 3
+SEMANTIC_SELECTION_HINT_CHARS = 1200
+SEMANTIC_SELECTION_EMBED_TIMEOUT = 300
+TOOL_CALL_MARKER_PATTERN = r'<\|FunctionCallBegin\||<tool_call>|<function_call>'
+SEMANTIC_SELECTION_INSTRUCTION = (
+    "Given a task state, retrieve relevant interaction turns that help continue solving the task."
+)
 
 
 class AgentState(Enum):
@@ -121,7 +133,7 @@ class AgentData:
         self.accumulated_response_finding_turn_ids: list[int] = []
 
         # Turn-level history used by ECHO context reconstruction.
-        self.turn_history: list[dict] = []  # [{"query": str, "finding": str, "source_traj_idx": int, "turn_id": int}]
+        self.turn_history: list[dict] = []  # [{"action": str, "finding": str, "source_traj_idx": int, "turn_id": int}]
         self.current_selected_traj_indices: list[int] = []
         self.current_selected_turn_ids: list[int] = []
         self.next_turn_id: int = 0
@@ -142,6 +154,9 @@ class ToolAgentLoop(AgentLoopBase):
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        self.chat_template_tool_schemas = (
+            self.tool_schemas if getattr(self.rollout_config.multi_turn, "inject_tool_schemas", True) else None
+        )
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
 
@@ -159,22 +174,85 @@ class ToolAgentLoop(AgentLoopBase):
         self.enable_summarization = getattr(self.rollout_config.multi_turn, 'enable_summarization', False)
         self.max_summary_rounds = getattr(self.rollout_config.multi_turn, 'max_summary_rounds', 2)
         self.working_context_length = getattr(self.rollout_config.multi_turn, 'working_context_length', 8192)
-        # "summary" uses generated summaries; "echo_e2e" lets the actor select retained turns.
+        # "summary" uses generated summaries; "truncate" drops oldest context;
+        # "echo_e2e" lets the actor select turns; "semantic_selection" ranks turns by embedding similarity.
         self.context_compression_method = getattr(self.rollout_config.multi_turn, 'context_compression_method', 'summary')
+        self.echo_recent_turns = int(getattr(self.rollout_config.multi_turn, 'echo_recent_turns', 3) or 0)
+        self.selection_max_turns = int(getattr(self.rollout_config.multi_turn, 'selection_max_turns', 8) or 0)
+        self.sum_last_turn_max_chars = int(getattr(self.rollout_config.multi_turn, 'sum_last_turn_max_chars', 300) or 300)
+        self.summary_max_chars = int(getattr(self.rollout_config.multi_turn, 'summary_max_chars', 3072) or 3072)
+        self.semantic_embed_url = self._infer_semantic_embed_url()
         self.summary_instruction = getattr(
             self.rollout_config.multi_turn, 
             'summary_instruction', 
-            "System:\nYou are a helpful agent interacting with a function calling environment to solve user's problem. The interaction history is now too long. Please summarize the interaction history.\n• Remember to keep the important information in the history to ensure that you can continue solving the problem.\n• Do not call any function in this turn.\nNow generate the summary, and put your summary inside tag <summary></summary>.\n"
+            "System:\n"
+            "You are a helpful agent interacting with a function calling environment to solve the problem.\n"
+            "The interaction history is now too long. Please summarize the interaction history.\n\n"
+            "Rules:\n"
+            "- Output exactly one <summary>...</summary> block.\n"
+            "- Do not call any function/tool in this turn.\n"
+            "- Do not include <think>, tool calls, markdown fences, or text outside the summary tags.\n"
+            "- Keep the important information needed to continue solving the problem.\n\n"
+            "<summary>\n"
+            "Task Objective:\n"
+            "- Original problem: [State the user problem.]\n\n"
+            "Current State:\n"
+            "- Key facts and constraints:\n"
+            "  - [Important verified fact, constraint, or intermediate result]\n"
+            "- Code or tool outputs:\n"
+            "  - [Important result from previous function/tool calls]\n"
+            "- Errors or failed attempts:\n"
+            "  - [Known dead end, exception, or incorrect approach]\n\n"
+            "Plan:\n"
+            "- Next step:\n"
+            "  - [Exact next action to continue solving the problem]\n"
+            "</summary>"
         )
         self.selection_instruction = getattr(
             self.rollout_config.multi_turn,
             'selection_instruction',
-            "[CONTEXT COMPRESSION] Your context is full. Previous interaction turns:\n{turn_list}\n\nSelect the most relevant turns to keep for solving the task.\nPut your selection inside <selection></selection> tags, one turn per line. Format: turn_N: reason\nExample:\nturn_0: contains the initial query constraints\nturn_3: has key API response data\nDo NOT output answers to the original task. ONLY output the selection tag."
+            "System:\n"
+            "Your operational context is full. Select prior interaction turns that are necessary to continue solving the task.\n\n"
+            "Rules:\n"
+            "- Output exactly one <selection>...</selection> block.\n"
+            "- Do not call any function/tool in this turn.\n"
+            "- Do not answer the original task.\n"
+            "- Do not include <think>, tool calls, markdown fences, or text outside the selection tags.\n"
+            "- Select only turns that contain reusable evidence, constraints, failed attempts, or the next planned action.\n"
+            "- Prefer older turns that are not already covered by automatically retained recent turns.\n"
+            "- If no older turn is necessary, return an empty <selection></selection> block.\n\n"
+            "Valid turns:\n"
+            "{turn_list}\n\n"
+            "<selection>\n"
+            "[zero or more lines, each formatted as turn_N: reason]\n"
+            "</selection>"
+        )
+        self.sum_last_turn_instruction = getattr(
+            self.rollout_config.multi_turn,
+            'sum_last_turn_instruction',
+            "# Turn Summary Requirement\n"
+            "After each tool/function response, before the next tool/function call, write one concise factual summary of that latest response.\n\n"
+            "Rules:\n"
+            "- Output exactly one <sum_last_turn>...</sum_last_turn> block before the next tool/function call.\n"
+            "- Put the block outside <think>; if you use <think>, close </think> before writing <sum_last_turn>.\n"
+            "- Summarize only the latest tool/function response and the useful result it provides.\n"
+            "- Do not include <think>, tool calls, markdown fences, or long raw passages inside the tags.\n"
+            "- Keep it short: one sentence or at most 300 characters.\n"
+            "- If the tool/function response failed or was empty, state the failure briefly.\n"
+            "- After closing </sum_last_turn>, continue with the next tool/function call only if needed.\n\n"
+            "<sum_last_turn>[one concise factual sentence]</sum_last_turn>"
+        )
+        self.sum_last_turn_hint = getattr(
+            self.rollout_config.multi_turn,
+            'sum_last_turn_hint',
+            "Before the next tool/function call, output exactly one <sum_last_turn>...</sum_last_turn> block "
+            "outside <think>, summarizing only the latest tool/function response. Keep it one sentence or at most "
+            "300 characters; do not include <think>, raw long passages, or tool calls inside the tags."
         )
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
-        messages = list(kwargs["raw_prompt"])
+        messages = deepcopy(kwargs["raw_prompt"])
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -331,22 +409,19 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
-        # Add the ECHO turn-summary requirement to the system prompt.
-        if self.enable_summarization and self.context_compression_method == "echo_e2e":
-            sum_instruction = (
-                "\n\n# Response Format\n"
-                "After receiving each tool response, you MUST include a brief summary of the key finding "
-                "from that tool response using <sum_last_turn></sum_last_turn> tags, "
-                "before making your next tool call."
-            )
+        # Add the turn-summary requirement to the system prompt for turn-selection compression.
+        if self.enable_summarization and self._is_turn_selection_method():
+            sum_instruction = "\n\n" + self.sum_last_turn_instruction.strip()
             for msg in agent_data.messages:
                 if msg.get("role") == "system":
                     msg["content"] = msg["content"] + sum_instruction
                     break
+            else:
+                agent_data.messages.insert(0, {"role": "system", "content": self.sum_last_turn_instruction.strip()})
 
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
-            tools=self.tool_schemas,
+            tools=self.chat_template_tool_schemas,
             images=agent_data.image_data,
             videos=agent_data.video_data,
         )
@@ -409,6 +484,7 @@ class ToolAgentLoop(AgentLoopBase):
                     finding = self._extract_turn_finding(full_output)
                     if finding:
                         pending["finding"] = finding
+                    pending["text"] = self._build_turn_text(pending.get("action", ""), pending.get("finding", ""))
                     self._mark_last_trajectory_finding_tokens(agent_data, full_output, pending.get("turn_id"))
 
                 if agent_data.turn_history:
@@ -419,10 +495,13 @@ class ToolAgentLoop(AgentLoopBase):
                             f"num_turns={len(agent_data.turn_history)}"
                         )
                         parsed = [{"index": i, "score": 0.5} for i in range(len(agent_data.turn_history))]
-                    selected_indices = parsed
+                    selected_indices = self._merge_selected_with_recent(parsed, len(agent_data.turn_history))
                     new_messages = self._build_echo_prompt(agent_data, selected_indices)
                 else:
                     new_messages = self._build_echo_prompt(agent_data, [])
+            elif self._is_truncate_method():
+                logger.warning("Unexpected auxiliary generation for truncate context compression.")
+                compression_ok = False
             else:
                 summary_text = self._summary_exclude_think(full_output)
                 if len(summary_text.strip()) < 10:
@@ -441,8 +520,8 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.warning("Context compression output unusable. Terminating.")
                 return AgentState.TERMINATED
 
-            new_prompt_ids = await self.apply_chat_template(new_messages, tools=self.tool_schemas)
-            if self.context_compression_method == "echo_e2e":
+            new_prompt_ids = await self.apply_chat_template(new_messages, tools=self.chat_template_tool_schemas)
+            if self._is_turn_selection_method():
                 agent_data.current_selected_traj_indices = sorted({
                     agent_data.turn_history[item["index"]].get("source_traj_idx")
                     for item in selected_indices
@@ -459,7 +538,7 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.is_summarizing = False
                     agent_data.overlong = True
                     logger.warning(
-                        "ECHO rebuilt prompt is still too long. "
+                        "Selection rebuilt prompt is still too long. "
                         f"prompt_length={len(new_prompt_ids)}, working_context_length={self.working_context_length}"
                     )
                     return AgentState.TERMINATED
@@ -486,6 +565,8 @@ class ToolAgentLoop(AgentLoopBase):
                     if item["index"] < len(agent_data.turn_history)
                 ]
                 if pending and pending.get("finding"):
+                    pending["text"] = self._build_turn_text(pending.get("action", ""), pending.get("finding", ""))
+                    pending.setdefault("embedding", None)
                     new_turn_history.append(pending)
                 agent_data.turn_history = new_turn_history
                 agent_data.pending_turn = None
@@ -496,10 +577,10 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.accumulated_response_ids.extend(agent_data.response_ids)
             agent_data.accumulated_response_mask.extend([1] * len(agent_data.response_ids))
             agent_data.accumulated_logprobs.extend(output.log_probs or [0.0] * len(agent_data.response_ids))
-            current_turn_id = agent_data.next_turn_id if self.context_compression_method == "echo_e2e" else -1
+            current_turn_id = agent_data.next_turn_id if self._is_turn_selection_method() else -1
             response_turn_ids = [current_turn_id] * len(agent_data.response_ids)
             response_finding_turn_ids = [-1] * len(agent_data.response_ids)
-            if self.context_compression_method == "echo_e2e":
+            if self._is_turn_selection_method():
                 full_text = await self.loop.run_in_executor(
                     None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
                 )
@@ -565,6 +646,21 @@ class ToolAgentLoop(AgentLoopBase):
                         )
                         return AgentState.TERMINATED
                     return await self._trigger_echo_selection(agent_data)
+                elif self.context_compression_method == "semantic_selection":
+                    agent_data.pending_turn = None
+                    self._save_current_trajectory_without_current_turn(agent_data)
+                    if not self._has_echo_selection_history(agent_data):
+                        agent_data.overlong = True
+                        logger.warning(
+                            "Semantic selection generation truncated before reusable turn history was available. "
+                            "Marking overlong."
+                        )
+                        return AgentState.TERMINATED
+                    return await self._trigger_semantic_selection(agent_data)
+                elif self._is_truncate_method():
+                    self._save_current_trajectory_without_current_turn(agent_data)
+                    rollback_prompt_ids = agent_data.current_traj_prompt_ids + agent_data.accumulated_response_ids
+                    return self._trigger_truncation(agent_data, base_prompt_ids=rollback_prompt_ids)
                 else:
                     self._save_current_trajectory_without_current_turn(agent_data)
                     return await self._trigger_summary(agent_data)
@@ -646,7 +742,7 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.tool_rewards.append(tool_reward)
 
         # Finalize the previous ECHO turn once the next assistant response is available.
-        if self.enable_summarization and self.context_compression_method == "echo_e2e":
+        if self.enable_summarization and self._is_turn_selection_method():
             pending = getattr(agent_data, 'pending_turn', None)
             if pending:
                 full_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
@@ -654,6 +750,8 @@ class ToolAgentLoop(AgentLoopBase):
                     finding = self._extract_turn_finding(full_text)
                     if finding:
                         pending["finding"] = finding
+                pending["text"] = self._build_turn_text(pending.get("action", ""), pending.get("finding", ""))
+                pending.setdefault("embedding", None)
                 self._mark_finding_turn_tokens(agent_data, full_text, pending.get("turn_id"))
 
                 agent_data.turn_history.append(pending)
@@ -662,22 +760,14 @@ class ToolAgentLoop(AgentLoopBase):
         # Add a separate ECHO hint message so chat-template boundaries remain intact.
         echo_inject_hint = (
             self.enable_summarization
-            and self.context_compression_method == "echo_e2e"
+            and self._is_turn_selection_method()
         )
         if echo_inject_hint:
-            query_str = ""
-            try:
-                for tc in agent_data.tool_calls:
-                    args = json.loads(tc.arguments)
-                    if isinstance(args, dict) and "query" in args:
-                        query_str = args["query"]
-                        break
-            except Exception:
-                query_str = ", ".join(f"{tc.name}({tc.arguments})" for tc in agent_data.tool_calls)[:100]
-
             agent_data.pending_turn = {
-                "query": query_str,
+                "action": self._format_turn_action(agent_data.tool_calls),
                 "finding": "",
+                "text": "",
+                "embedding": None,
                 "source_traj_idx": len(agent_data.trajectory_outputs),
                 "turn_id": agent_data.next_turn_id,
             }
@@ -685,7 +775,7 @@ class ToolAgentLoop(AgentLoopBase):
             
             hint_msg = {
                 "role": "user",
-                "content": "You must summarize the key finding from the last tool response in <sum_last_turn></sum_last_turn> before <tool_call>",
+                "content": self.sum_last_turn_hint,
             }
             encode_messages = add_messages + [hint_msg]
         else:
@@ -714,6 +804,8 @@ class ToolAgentLoop(AgentLoopBase):
                 remove_system_prompt=True,
             )
 
+        is_finish_tool = any(name.lower() in ("finish", "stop", "submit") for name in tool_call_names)
+
         if self.enable_summarization:
             current_total_length = (
                 len(agent_data.current_traj_prompt_ids) +
@@ -721,7 +813,7 @@ class ToolAgentLoop(AgentLoopBase):
                 len(tool_response_ids)
             )
             
-            if current_total_length >= self.working_context_length:
+            if current_total_length >= self.working_context_length and not is_finish_tool:
                 if agent_data.summary_count < self.max_summary_rounds:
                     if self.context_compression_method == "echo_e2e":
                         n_hist = len(getattr(agent_data, 'turn_history', []))
@@ -738,7 +830,9 @@ class ToolAgentLoop(AgentLoopBase):
                             self._save_current_trajectory_without_current_turn(agent_data)
                             return AgentState.TERMINATED
 
-                        # Drop the pending turn because its tool response did not fit in the segment.
+                        # Keep the training segment aligned with the compressed next state:
+                        # the overflow turn is rolled back before saving, so its
+                        # think/tool-call/tool-response tokens are not trained.
                         a_t_len = len(agent_data.response_ids)
                         if a_t_len > 0:
                             agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
@@ -758,7 +852,20 @@ class ToolAgentLoop(AgentLoopBase):
                             )
                             return AgentState.TERMINATED
                         return await self._trigger_echo_selection(agent_data)
-                    else:
+                    elif self.context_compression_method == "semantic_selection":
+                        n_hist = len(getattr(agent_data, 'turn_history', []))
+                        if n_hist == 0:
+                            agent_data.overlong = True
+                            logger.warning(
+                                "Semantic selection overflow occurred before reusable turn history was available. "
+                                "Marking overlong."
+                            )
+                            self._save_current_trajectory_without_current_turn(agent_data)
+                            return AgentState.TERMINATED
+
+                        current_action_hint = self._format_turn_action(agent_data.tool_calls)
+                        current_observation_hint = self._compact_observation_hint(add_messages)
+
                         a_t_len = len(agent_data.response_ids)
                         if a_t_len > 0:
                             agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
@@ -768,12 +875,53 @@ class ToolAgentLoop(AgentLoopBase):
                             agent_data.accumulated_response_finding_turn_ids = (
                                 agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
                             )
+                        agent_data.pending_turn = None
                         self._save_current_trajectory_without_current_turn(agent_data)
+                        return await self._trigger_semantic_selection(
+                            agent_data,
+                            current_action_hint=current_action_hint,
+                            current_observation_hint=current_observation_hint,
+                        )
+                    elif self._is_truncate_method():
+                        self._save_current_trajectory_with_extra_response(
+                            agent_data,
+                            extra_response_ids=tool_response_ids,
+                        )
+                        if new_images_this_turn:
+                            if agent_data.image_data is None:
+                                agent_data.image_data = []
+                            elif not isinstance(agent_data.image_data, list):
+                                agent_data.image_data = [agent_data.image_data]
+                            for img in new_images_this_turn:
+                                agent_data.image_data.append(img)
+                        agent_data.user_turns += 1
+                        return self._trigger_truncation(
+                            agent_data,
+                            extra_prompt_ids=tool_response_ids,
+                        )
+                    else:
+                        self._save_current_trajectory_with_extra_response(
+                            agent_data,
+                            extra_response_ids=tool_response_ids,
+                        )
+                        a_t_len = len(agent_data.response_ids)
+                        if a_t_len > 0:
+                            agent_data.accumulated_response_ids = agent_data.accumulated_response_ids[:-a_t_len]
+                            agent_data.accumulated_response_mask = agent_data.accumulated_response_mask[:-a_t_len]
+                            agent_data.accumulated_logprobs = agent_data.accumulated_logprobs[:-a_t_len]
+                            agent_data.accumulated_response_turn_ids = agent_data.accumulated_response_turn_ids[:-a_t_len]
+                            agent_data.accumulated_response_finding_turn_ids = (
+                                agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
+                            )
                         return await self._trigger_summary(agent_data)
                 else:
                     agent_data.overlong = True
                     logger.warning(
                         f"Reached max context compression rounds ({self.max_summary_rounds}). Marking overlong."
+                    )
+                    self._save_current_trajectory_with_extra_response(
+                        agent_data,
+                        extra_response_ids=tool_response_ids,
                     )
                     return AgentState.TERMINATED
                     
@@ -804,7 +952,7 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += [0.0] * len(tool_response_ids)
         agent_data.user_turns += 1
         # Terminate if any tool is a stop/finish tool
-        if any(name.lower() in ("finish", "stop", "submit") for name in tool_call_names):
+        if is_finish_tool:
             return AgentState.TERMINATED
         return AgentState.GENERATING
 
@@ -845,6 +993,41 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             return AgentState.GENERATING
 
+    @staticmethod
+    def _normalize_tool_arguments(tool_name: str, raw_args: Any) -> dict[str, Any]:
+        """Normalize common malformed tool arguments into the dict shape tools expect."""
+        if isinstance(raw_args, dict):
+            return raw_args
+
+        if raw_args is None:
+            return {}
+
+        # Some models emit a JSON object as a string in the arguments field.
+        if isinstance(raw_args, str):
+            text = raw_args.strip()
+            if not text:
+                return {}
+            if text.startswith("{"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+
+            if tool_name == "search":
+                return {"query": text}
+            if tool_name == "open_page":
+                return {"docid": text}
+            if tool_name == "finish":
+                return {"answer": text}
+
+        # Accept the common single-call shape defensively.
+        if isinstance(raw_args, list) and len(raw_args) == 1 and isinstance(raw_args[0], dict):
+            return raw_args[0]
+
+        return {}
+
     async def _call_tool(
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
@@ -852,8 +1035,14 @@ class ToolAgentLoop(AgentLoopBase):
         tool, instance_id = None, None
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
-            tool_name = tool_call.name
-            tool_args = json.loads(tool_call.arguments)
+            tool_name = str(tool_call.name).strip()
+            if tool_name not in self.tools and tool_name.lower() in self.tools:
+                tool_name = tool_name.lower()
+            try:
+                raw_tool_args = json.loads(tool_call.arguments)
+            except json.JSONDecodeError:
+                raw_tool_args = tool_call.arguments
+            tool_args = self._normalize_tool_arguments(tool_name, raw_tool_args)
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
@@ -906,15 +1095,200 @@ class ToolAgentLoop(AgentLoopBase):
         interaction_map = initialize_interactions_from_config(interaction_config_file)
         return interaction_map
 
+    def _infer_semantic_embed_url(self) -> str:
+        """Reuse the BCP retrieval service for semantic turn-selection embeddings."""
+        search_tool = self.tools.get("search") if hasattr(self, "tools") else None
+        retrieval_url = str(getattr(search_tool, "retrieval_service_url", "") or "")
+        if retrieval_url.endswith("/retrieve"):
+            return retrieval_url[: -len("/retrieve")] + "/embed"
+        if retrieval_url:
+            return retrieval_url.rstrip("/") + "/embed"
+        return "http://10.52.100.144:8000/embed"
+
+    def _is_turn_selection_method(self) -> bool:
+        """Whether this compression method maintains ECHO-style turn history."""
+        return self.context_compression_method in ("echo_e2e", "semantic_selection")
+
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if text:
+                        parts.append(str(text))
+                elif item is not None:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _get_original_user_query(self, agent_data: AgentData) -> str:
+        """Return the original user task for semantic selection queries."""
+        messages = agent_data.original_messages or agent_data.messages
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                text = self._message_content_to_text(msg.get("content")).strip()
+                if text:
+                    return text[:2000]
+        return ""
+
+    @staticmethod
+    def _build_turn_text(action: str, finding: str) -> str:
+        return f"Action: {str(action or '').strip()}\nFinding: {str(finding or '').strip()}".strip()
+
+    def _compact_observation_hint(self, messages: list[dict[str, Any]]) -> str:
+        """Extract a short hint from the current tool observation without committing it as history."""
+        chunks = []
+        for msg in messages or []:
+            if msg.get("role") != "tool":
+                continue
+            text = self._message_content_to_text(msg.get("content")).strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    text = str(parsed.get("result") or parsed.get("error") or text)
+            except Exception:
+                pass
+            chunks.append(re.sub(r"\s+", " ", text).strip())
+        return "\n".join(chunks)[:SEMANTIC_SELECTION_HINT_CHARS]
+
+    def _build_semantic_selection_query(
+        self,
+        agent_data: AgentData,
+        current_action_hint: str = "",
+        current_observation_hint: str = "",
+    ) -> str:
+        """Build a short state query for matching against turn_history embeddings."""
+        parts = []
+        original_query = self._get_original_user_query(agent_data)
+        if original_query:
+            parts.append(f"Question: {original_query}")
+
+        state_units = []
+        if current_action_hint or current_observation_hint:
+            state_units.append({
+                "action": current_action_hint,
+                "finding": current_observation_hint,
+                "label": "Current",
+            })
+
+        remaining = max(0, SEMANTIC_SELECTION_QUERY_UNITS - len(state_units))
+        if remaining:
+            for turn in agent_data.turn_history[-remaining:]:
+                state_units.append({
+                    "action": turn.get("action", ""),
+                    "finding": turn.get("finding", ""),
+                    "label": "Recent",
+                })
+
+        for item in state_units:
+            turn_text = self._build_turn_text(item.get("action", ""), item.get("finding", ""))
+            if turn_text:
+                parts.append(f"{item['label']}:\n{turn_text}")
+
+        return "\n\n".join(parts).strip()
+
+    async def _embed_semantic_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        payload = {
+            "texts": texts,
+            "instruction": SEMANTIC_SELECTION_INSTRUCTION,
+        }
+
+        def _post_embed():
+            resp = requests.post(
+                self.semantic_embed_url,
+                json=payload,
+                timeout=SEMANTIC_SELECTION_EMBED_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("error"):
+                raise RuntimeError(data["error"])
+            embeddings = data.get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+                raise RuntimeError(f"Invalid embedding response from {self.semantic_embed_url}")
+            return embeddings
+
+        return await self.loop.run_in_executor(None, _post_embed)
+
+    @staticmethod
+    def _embedding_dot(query_emb: list[float], turn_emb: list[float]) -> float:
+        return float(sum(float(a) * float(b) for a, b in zip(query_emb, turn_emb)))
+
+    async def _select_semantic_turns(
+        self,
+        agent_data: AgentData,
+        current_action_hint: str = "",
+        current_observation_hint: str = "",
+    ) -> list[dict]:
+        """Select turn_history entries by embedding similarity to the current state query."""
+        query_text = self._build_semantic_selection_query(
+            agent_data,
+            current_action_hint=current_action_hint,
+            current_observation_hint=current_observation_hint,
+        )
+        missing_indices = []
+        missing_texts = []
+        for idx, turn in enumerate(agent_data.turn_history):
+            if not turn.get("text"):
+                turn["text"] = self._build_turn_text(turn.get("action", ""), turn.get("finding", ""))
+            if turn.get("embedding") is None:
+                missing_indices.append(idx)
+                missing_texts.append(turn["text"])
+
+        embeddings = await self._embed_semantic_texts([query_text] + missing_texts)
+        query_emb = embeddings[0]
+        for idx, emb in zip(missing_indices, embeddings[1:]):
+            agent_data.turn_history[idx]["embedding"] = emb
+
+        scored = []
+        for idx, turn in enumerate(agent_data.turn_history):
+            emb = turn.get("embedding")
+            if emb is None:
+                continue
+            scored.append({
+                "index": idx,
+                "score": self._embedding_dot(query_emb, emb),
+                "source": "semantic",
+            })
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[: min(SEMANTIC_SELECTION_TOPK, len(scored))]
+
     def _extract_turn_finding(self, full_text: str) -> str:
         """Extract the latest ECHO turn summary from generated text."""
-        m = re.search(r'<sum_last_turn>(.*?)</sum_last_turn>', full_text, flags=re.DOTALL)
+        m = re.search(r'<sum_last_turn>(.*?)</sum_last_turn>', full_text, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            return self._sanitize_turn_finding(m.group(1))
+        m = re.search(r'<sum_last_turn>(.*)', full_text, flags=re.DOTALL | re.IGNORECASE)
         if m and m.group(1).strip():
-            return m.group(1).strip()[:300]
-        m = re.search(r'<sum_last_turn>(.*)', full_text, flags=re.DOTALL)
-        if m and m.group(1).strip():
-            return m.group(1).strip()[:300]
+            logger.warning("No closing </sum_last_turn> tag found in turn summary; using text after <sum_last_turn>.")
+            return self._sanitize_turn_finding(m.group(1))
         return ""
+
+    def _sanitize_turn_finding(self, content: str) -> str:
+        """Keep only concise factual text from a generated ECHO turn summary."""
+        content = re.sub(r'<think>.*?</think>', '', str(content or ''), flags=re.DOTALL).strip()
+        content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
+        content = re.split(
+            TOOL_CALL_MARKER_PATTERN,
+            content,
+            maxsplit=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )[0].strip()
+        content = re.sub(r'</?sum_last_turn>', '', content, flags=re.IGNORECASE).strip()
+        content = re.sub(r'\s+', ' ', content).strip()
+        return content[:self.sum_last_turn_max_chars]
 
     def _has_echo_selection_history(self, agent_data: AgentData) -> bool:
         """Whether ECHO has at least one retained turn that can participate in selection."""
@@ -923,16 +1297,35 @@ class ToolAgentLoop(AgentLoopBase):
     def _parse_selection_indices(self, full_output: str, max_turns: int) -> list[dict] | None:
         """Parse selected ECHO turn indices from actor output."""
         cleaned = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
-        selection_match = re.search(r'<selection>(.*?)</selection>', cleaned, flags=re.DOTALL)
-        if not selection_match:
-            logger.debug("No ECHO <selection> tag found in compression output.")
-            return None
+        selection_match = re.search(r'<selection>(.*?)</selection>', cleaned, flags=re.DOTALL | re.IGNORECASE)
+        if selection_match:
+            content = selection_match.group(1).strip()
+        else:
+            open_match = re.search(r'<selection>(.*)', cleaned, flags=re.DOTALL | re.IGNORECASE)
+            if open_match:
+                content = open_match.group(1).strip()
+                logger.warning("No closing </selection> tag found in compression output; using text after <selection>.")
+            else:
+                content = re.sub(r'<think>.*', '', cleaned, flags=re.DOTALL).strip()
+                if content:
+                    logger.warning("No <selection> tag found in compression output; using fallback text.")
+                else:
+                    logger.debug("No ECHO selection content found in compression output.")
+                    return []
 
-        content = selection_match.group(1).strip()
+        content = re.split(
+            r'<\|FunctionCallBegin\||<tool_call>|<function_call>',
+            content,
+            maxsplit=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )[0].strip()
         results = []
         seen = set()
         out_of_range = []
-        for m in re.finditer(r'turn_(\d+)', content, re.IGNORECASE):
+        for line in content.splitlines():
+            m = re.match(r'\s*(?:[-*]\s*)?turn_(\d+)\b', line, re.IGNORECASE)
+            if not m:
+                continue
             idx = int(m.group(1))
             if idx in seen:
                 continue
@@ -941,12 +1334,55 @@ class ToolAgentLoop(AgentLoopBase):
                 results.append({"index": idx, "score": 0.5})
             else:
                 out_of_range.append(idx)
+        if self.selection_max_turns > 0 and len(results) > self.selection_max_turns:
+            logger.warning(
+                f"ECHO selection produced {len(results)} valid turns; "
+                f"keeping first {self.selection_max_turns} model-selected turns before recent-turn retention."
+            )
+            results = results[:self.selection_max_turns]
         if out_of_range:
             logger.warning(
                 f"ECHO selection contained out-of-range turns {out_of_range}; "
                 f"max_turn_index={max_turns - 1}, valid_selections={[r['index'] for r in results]}"
             )
         return sorted(results, key=lambda x: x["index"])
+
+    @staticmethod
+    def _get_turn_action(turn: dict) -> str:
+        """Return the generic turn action, with compatibility for older query-only entries."""
+        return str(turn.get("action") or turn.get("query") or "")
+
+    @staticmethod
+    def _format_single_tool_action(tool_call: FunctionCall) -> str:
+        """Format a tool/function call into a compact task-agnostic action string."""
+        name = str(tool_call.name)
+        try:
+            args = json.loads(tool_call.arguments)
+        except Exception:
+            return f"{name}({tool_call.arguments})"[:300]
+
+        if not isinstance(args, dict):
+            return f"{name}({args})"[:300]
+
+        # BCP/search tasks benefit from showing the human-readable lookup target.
+        if name == "search" and args.get("query"):
+            return f"search(query={args.get('query')})"[:300]
+        if name == "open_page":
+            docid = args.get("docid") or args.get("id") or args.get("url")
+            if docid:
+                return f"open_page(docid={docid})"[:300]
+        if name == "finish" and args.get("answer"):
+            return f"finish(answer={args.get('answer')})"[:300]
+
+        # CodeGym and other function-calling tasks should keep the actual function
+        # name plus parameters instead of pretending the action is a search query.
+        compact_args = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        return f"{name}({compact_args})"[:300]
+
+    def _format_turn_action(self, tool_calls: list[FunctionCall]) -> str:
+        """Format one assistant turn's tool/function calls for ECHO turn history."""
+        actions = [self._format_single_tool_action(tool_call) for tool_call in tool_calls]
+        return " | ".join(action for action in actions if action)[:600]
 
     def _build_echo_prompt(self, agent_data: AgentData, selected_turns: list[dict]) -> list[dict]:
         """Build prompt messages from selected ECHO turn history."""
@@ -955,9 +1391,9 @@ class ToolAgentLoop(AgentLoopBase):
             idx = item["index"]
             if idx < len(agent_data.turn_history):
                 turn = agent_data.turn_history[idx]
-                query = turn.get("query", "")
+                action = self._get_turn_action(turn)
                 finding = turn.get("finding", "")
-                selected_messages.append({"role": "assistant", "content": f"[turn_{idx} Query] {query}"})
+                selected_messages.append({"role": "assistant", "content": f"[turn_{idx} Action] {action}"})
                 selected_messages.append({"role": "tool", "content": f"[turn_{idx} Key Finding] {finding}"})
 
         new_messages = [
@@ -968,26 +1404,177 @@ class ToolAgentLoop(AgentLoopBase):
         selected_indices = [item["index"] for item in selected_turns]
         return new_messages
 
+    def _merge_selected_with_recent(
+        self,
+        selected_turns: list[dict],
+        max_turns: int,
+        recent_k: int | None = None,
+    ) -> list[dict]:
+        """Retain model-selected turns plus the latest configured ECHO turns."""
+        if max_turns <= 0:
+            return []
+
+        merged: dict[int, dict] = {}
+        for item in selected_turns or []:
+            idx = item.get("index")
+            if isinstance(idx, int) and 0 <= idx < max_turns:
+                merged[idx] = item
+
+        recent_k = self.echo_recent_turns if recent_k is None else recent_k
+        recent_k = max(0, int(recent_k))
+        if recent_k > 0:
+            start = max(0, max_turns - recent_k)
+            for idx in range(start, max_turns):
+                merged.setdefault(idx, {"index": idx, "score": 0.5, "source": "recent"})
+
+        return [merged[idx] for idx in sorted(merged)]
+
     def _summary_exclude_think(self, full_output):
         """Extract summary text while ignoring the generated thinking block."""
-        cleaned = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
+        without_closed_think = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
 
-        match = re.search(r'<summary>(.*?)</summary>', cleaned, flags=re.DOTALL)
+        match = re.search(r'<summary>(.*?)</summary>', without_closed_think, flags=re.DOTALL)
         if match:
             summary_content = match.group(1).strip()
         else:
-            open_match = re.search(r'<summary>(.*)', cleaned, flags=re.DOTALL)
+            open_match = re.search(r'<summary>(.*)', without_closed_think, flags=re.DOTALL)
             if open_match:
                 summary_content = open_match.group(1).strip()
+                logger.warning("No closing </summary> tag found in compression output; using text after <summary>.")
             else:
-                summary_content = cleaned
-            logger.warning("No <summary> tag found in compression output; using fallback text.")
-            max_summary_chars = 3072
-            if len(summary_content) > max_summary_chars:
-                summary_content = summary_content[:max_summary_chars] + "...(truncated)"
-                logger.warning(f"Fallback summary truncated to {max_summary_chars} characters.")
+                # If the model forgot to close <think> but still started <summary>,
+                # prefer the explicit summary span over dropping the whole output.
+                open_match = re.search(r'<summary>(.*)', full_output, flags=re.DOTALL)
+                if open_match:
+                    summary_content = open_match.group(1).strip()
+                    logger.warning("No closing </summary> tag found in compression output; using text after <summary>.")
+                else:
+                    cleaned = re.sub(r'<think>.*?</think>', '', full_output, flags=re.DOTALL).strip()
+                    cleaned = re.sub(r'<think>.*', '', cleaned, flags=re.DOTALL).strip()
+                    summary_content = cleaned
+                    logger.warning("No <summary> tag found in compression output; using fallback text.")
+
+        if len(summary_content) > self.summary_max_chars:
+            summary_content = summary_content[:self.summary_max_chars] + "...(truncated)"
+            logger.warning(f"Context summary truncated to {self.summary_max_chars} characters.")
 
         return summary_content
+
+    def _is_truncate_method(self) -> bool:
+        """Whether context compression should keep a left-truncated raw context."""
+        return self.context_compression_method in ("truncate", "truncated")
+
+    def _left_truncate_prompt_ids(self, prompt_ids: list[int]) -> list[int]:
+        """Keep the most recent tokens under the working-context budget."""
+        keep_len = min(len(prompt_ids), int(self.working_context_length))
+        if keep_len <= 0:
+            return []
+        return list(prompt_ids[-keep_len:])
+
+    def _trigger_truncation(
+        self,
+        agent_data: AgentData,
+        base_prompt_ids: list[int] | None = None,
+        extra_prompt_ids: list[int] | None = None,
+    ) -> AgentState:
+        """Continue from the raw context suffix after saving the current trajectory segment."""
+        full_prompt_ids = list(base_prompt_ids if base_prompt_ids is not None else agent_data.prompt_ids)
+        if extra_prompt_ids:
+            full_prompt_ids.extend(extra_prompt_ids)
+
+        new_prompt_ids = self._left_truncate_prompt_ids(full_prompt_ids)
+        agent_data.prompt_ids = new_prompt_ids
+        agent_data.current_traj_prompt_ids = list(new_prompt_ids)
+        agent_data.response_ids = []
+        agent_data.response_mask = []
+        agent_data.response_logprobs = []
+        agent_data.accumulated_response_ids = []
+        agent_data.accumulated_response_mask = []
+        agent_data.accumulated_logprobs = []
+        agent_data.accumulated_response_turn_ids = []
+        agent_data.accumulated_response_finding_turn_ids = []
+        agent_data.is_summarizing = False
+        agent_data.summary_count += 1
+        logger.debug(
+            "Triggering truncate context compression. "
+            f"round={agent_data.summary_count}, prompt_length={len(new_prompt_ids)}"
+        )
+        return AgentState.GENERATING
+
+    async def _trigger_semantic_selection(
+        self,
+        agent_data: AgentData,
+        current_action_hint: str = "",
+        current_observation_hint: str = "",
+    ) -> AgentState:
+        """Rebuild context with embedding-selected turn history."""
+        try:
+            selected = await self._select_semantic_turns(
+                agent_data,
+                current_action_hint=current_action_hint,
+                current_observation_hint=current_observation_hint,
+            )
+        except Exception as exc:
+            logger.warning(f"Semantic selection failed; retaining recent turns only. error={exc}")
+            selected = []
+
+        selected_indices = self._merge_selected_with_recent(
+            selected,
+            len(agent_data.turn_history),
+            recent_k=SEMANTIC_SELECTION_RECENT_TURNS,
+        )
+        if not selected_indices:
+            agent_data.overlong = True
+            logger.warning("Semantic selection had no reusable turns. Marking overlong.")
+            return AgentState.TERMINATED
+
+        new_messages = self._build_echo_prompt(agent_data, selected_indices)
+        new_prompt_ids = await self.apply_chat_template(new_messages, tools=self.chat_template_tool_schemas)
+        if len(new_prompt_ids) > int(self.working_context_length * 0.8):
+            agent_data.overlong = True
+            logger.warning(
+                "Semantic selection rebuilt prompt is still too long. "
+                f"prompt_length={len(new_prompt_ids)}, working_context_length={self.working_context_length}"
+            )
+            return AgentState.TERMINATED
+
+        agent_data.current_selected_traj_indices = sorted({
+            agent_data.turn_history[item["index"]].get("source_traj_idx")
+            for item in selected_indices
+            if item["index"] < len(agent_data.turn_history)
+            and agent_data.turn_history[item["index"]].get("source_traj_idx") is not None
+        })
+        agent_data.current_selected_turn_ids = sorted({
+            agent_data.turn_history[item["index"]].get("turn_id")
+            for item in selected_indices
+            if item["index"] < len(agent_data.turn_history)
+            and agent_data.turn_history[item["index"]].get("turn_id") is not None
+        })
+
+        agent_data.prompt_ids = new_prompt_ids
+        agent_data.messages = new_messages
+        agent_data.current_traj_prompt_ids = list(agent_data.prompt_ids)
+        agent_data.response_ids = []
+        agent_data.response_logprobs = []
+        agent_data.accumulated_response_ids = []
+        agent_data.accumulated_response_mask = []
+        agent_data.accumulated_logprobs = []
+        agent_data.accumulated_response_turn_ids = []
+        agent_data.accumulated_response_finding_turn_ids = []
+        agent_data.is_summarizing = False
+        agent_data.summary_count += 1
+        agent_data.turn_history = [
+            agent_data.turn_history[item["index"]]
+            for item in selected_indices
+            if item["index"] < len(agent_data.turn_history)
+        ]
+        agent_data.pending_turn = None
+        logger.debug(
+            "Semantic selection compression complete. "
+            f"selected_turns={[item['index'] for item in selected_indices]}, "
+            f"prompt_length={len(new_prompt_ids)}"
+        )
+        return AgentState.GENERATING
 
     async def _trigger_summary(self, agent_data: AgentData) -> AgentState:
         """Trigger summary-based context compression."""
@@ -1011,15 +1598,26 @@ class ToolAgentLoop(AgentLoopBase):
         """Trigger ECHO turn-selection context compression."""
         turn_descriptions = []
         for i, turn in enumerate(agent_data.turn_history):
-            query = turn.get("query", "")
+            action = self._get_turn_action(turn)
             finding = turn.get("finding", "")
-            turn_descriptions.append(f"turn_{i}: query=\"{query}\" | finding=\"{finding}\"")
+            turn_descriptions.append(f"turn_{i}: action=\"{action}\" | finding=\"{finding}\"")
         turn_list_str = "\n".join(turn_descriptions) if turn_descriptions else "(none)"
         n_hist = len(agent_data.turn_history)
 
         instruction = self.selection_instruction.format(turn_list=turn_list_str)
         if n_hist > 0:
             instruction += f"\n\nValid selection indices: turn_0 ~ turn_{n_hist-1}."
+            if self.selection_max_turns > 0:
+                instruction += (
+                    f"\nSelect at most {self.selection_max_turns} historical turns; "
+                    "output an empty selection if the automatically retained recent turns are enough."
+                )
+            if self.echo_recent_turns > 0:
+                recent_start = max(0, n_hist - self.echo_recent_turns)
+                instruction += (
+                    f"\nThe latest turns turn_{recent_start} ~ turn_{n_hist-1} "
+                    "will be retained automatically; select any additional older turns that are still needed."
+                )
         else:
             instruction += f"\n\nNo historical turns for selection, return empty inside <selection></selection>."
         
@@ -1047,12 +1645,25 @@ class ToolAgentLoop(AgentLoopBase):
         summary_span_mask = [False] * len(response_ids)
         if not response_ids:
             return summary_span_mask
-        match = re.search(r"<sum_last_turn>.*?(?:</sum_last_turn>|$)", text, flags=re.DOTALL)
-        if not match:
+        match = re.search(r"<sum_last_turn>.*?</sum_last_turn>", text, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            span_start = match.start()
+            span_end = match.end()
+        else:
+            open_match = re.search(r"<sum_last_turn>(.*)", text, flags=re.DOTALL | re.IGNORECASE)
+            if not open_match:
+                return summary_span_mask
+            span_start = open_match.start()
+            marker_match = re.search(TOOL_CALL_MARKER_PATTERN, open_match.group(1), flags=re.IGNORECASE | re.DOTALL)
+            if marker_match:
+                span_end = open_match.start(1) + marker_match.start()
+            else:
+                span_end = len(text)
+        if span_end <= span_start:
             return summary_span_mask
 
-        prefix_ids = self.tokenizer.encode(text[: match.start()], add_special_tokens=False)
-        span_ids = self.tokenizer.encode(text[match.start() : match.end()], add_special_tokens=False)
+        prefix_ids = self.tokenizer.encode(text[:span_start], add_special_tokens=False)
+        span_ids = self.tokenizer.encode(text[span_start:span_end], add_special_tokens=False)
         start = min(len(prefix_ids), len(response_ids))
         end = min(start + len(span_ids), len(response_ids))
         for idx in range(start, end):
@@ -1137,6 +1748,48 @@ class ToolAgentLoop(AgentLoopBase):
             is_final=False,
         ))
         
+
+    def _save_current_trajectory_with_extra_response(
+        self,
+        agent_data: AgentData,
+        extra_response_ids: list[int] | None = None,
+        extra_response_turn_id: int = -1,
+    ):
+        """Save the current segment, optionally appending a just-produced tool response.
+
+        When a tool response makes the segment cross the working-context limit,
+        the next compressed state discards that overflow turn. The policy tokens
+        from the turn should still remain trainable, so we persist them here
+        before rolling back accumulated state for summary generation.
+        """
+        resp = list(agent_data.accumulated_response_ids)
+        mask = list(agent_data.accumulated_response_mask)
+        logp = list(agent_data.accumulated_logprobs)
+        turn_ids = list(agent_data.accumulated_response_turn_ids)
+        finding_turn_ids = list(agent_data.accumulated_response_finding_turn_ids)
+
+        if extra_response_ids:
+            extra_len = len(extra_response_ids)
+            resp.extend(extra_response_ids)
+            mask.extend([0] * extra_len)
+            logp.extend([0.0] * extra_len)
+            turn_ids.extend([extra_response_turn_id] * extra_len)
+            finding_turn_ids.extend([-1] * extra_len)
+
+        min_len = min(len(resp), len(mask), len(logp), len(turn_ids), len(finding_turn_ids))
+        if min_len == 0:
+            return
+
+        agent_data.trajectory_outputs.append(TrajectoryOutput(
+            prompt_ids=list(agent_data.current_traj_prompt_ids),
+            response_ids=list(resp[:min_len]),
+            response_mask=list(mask[:min_len]),
+            response_logprobs=list(logp[:min_len]),
+            response_turn_ids=list(turn_ids[:min_len]),
+            response_finding_turn_ids=list(finding_turn_ids[:min_len]),
+            is_final=False,
+        ))
+
 
     def _append_summary_to_current_trajectory(self, agent_data: AgentData, summary_logprobs: list[float]):
         """Append the compression instruction and generated output to the latest segment."""

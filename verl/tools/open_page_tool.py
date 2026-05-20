@@ -1,16 +1,4 @@
-"""
-OpenPage tool — sub-document chunk retrieval via the retrieval service.
-
-Instead of returning the full document (which can overwhelm the context
-window), this tool sends the docid **and** the user's query to the
-``/get_doc_chunks`` endpoint.  The server splits the document into
-overlapping chunks, ranks them with BM25, and returns the top-k most
-relevant chunks.
-
-This mirrors a two-stage retrieval setup:
-    search  → top-k document snippets (≈512 tokens each)
-    open_page → top-k *intra-document* chunks for a specific doc
-"""
+"""OpenPage tool — retrieve a document by docid with a fixed truncation budget."""
 
 import json
 import logging
@@ -36,15 +24,13 @@ NON_RETRYABLE_STATUS = {400, 401, 403, 404, 422}
 
 
 class OpenPageTool(BaseTool):
-    """Fetch relevant chunks of a document by docid + query."""
+    """Fetch a document by docid and return its beginning up to max_chars."""
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
         self.retrieval_service_url = config.get("retrieval_service_url")
         assert self.retrieval_service_url, "Configuration must include 'retrieval_service_url'"
-        self.topk_chunks = config.get("topk_chunks", 3)
-        self.chunk_size = config.get("chunk_size", 512)
-        self.chunk_overlap = config.get("chunk_overlap", 64)
+        self.max_chars = config.get("max_chars", 16000)
         self.timeout = config.get("timeout", 30)
         self._instance_dict = {}
 
@@ -57,13 +43,10 @@ class OpenPageTool(BaseTool):
     @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs):
         docid = parameters.get("docid", "")
-        query = parameters.get("query", "")
 
-        # Sanitize: ensure docid/query are strings
+        # Sanitize: ensure docid is a string.
         if not isinstance(docid, str):
             docid = str(docid)
-        if not isinstance(query, str):
-            query = str(query)
 
         # Strip common copy-paste artifacts like "[docid: 12345]"
         docid = docid.strip().strip("[]")
@@ -73,18 +56,9 @@ class OpenPageTool(BaseTool):
         if not docid:
             err = json.dumps({"error": "Missing 'docid' parameter."})
             return ToolResponse(text=err), 0.0, {}
-        if not query:
-            err = json.dumps({"error": "Missing 'query' parameter. Provide the question you want to answer from this document."})
-            return ToolResponse(text=err), 0.0, {}
 
         url = self.retrieval_service_url
-        payload = {
-            "docid": docid,
-            "query": query,
-            "topk": self.topk_chunks,
-            "chunk_size": self.chunk_size,
-            "chunk_overlap": self.chunk_overlap,
-        }
+        payload = {"docid": docid}
         last_error = None
 
         for attempt in range(MAX_RETRIES):
@@ -108,16 +82,15 @@ class OpenPageTool(BaseTool):
                     # Server returned a semantic error (e.g., docid not found)
                     return ToolResponse(text=json.dumps({"error": f"{data['error']}. Try a different docid from search results."})), 0.0, {}
 
-                # Format chunks into readable text
-                title = data.get("title", "Unknown")
-                chunks = data.get("chunks", [])
-                total_chunks = data.get("total_chunks", 0)
-
-                parts = [f"Document (Title: {title}) [docid: {docid}] — showing {len(chunks)}/{total_chunks} most relevant chunks:\n"]
-                for i, chunk in enumerate(chunks):
-                    parts.append(f"--- Chunk {chunk['chunk_index']+1}/{total_chunks} (score: {chunk['score']:.3f}) ---\n{chunk['text']}\n")
-
-                result_text = "\n".join(parts)
+                document = data.get("document") or {}
+                content = str(document.get("contents") or "")
+                original_chars = len(content)
+                if self.max_chars and original_chars > self.max_chars:
+                    content = content[: self.max_chars] + "\n...(truncated)"
+                result_text = (
+                    f"Document [docid: {docid}] "
+                    f"(showing {len(content)}/{original_chars} chars):\n{content}"
+                )
                 return ToolResponse(text=json.dumps({"result": result_text}, ensure_ascii=False)), 0.0, {}
 
             except requests.exceptions.ConnectionError:

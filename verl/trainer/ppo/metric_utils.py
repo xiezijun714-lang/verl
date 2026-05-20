@@ -78,6 +78,16 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _safe_tensor_stats(values: torch.Tensor) -> tuple[float, float, float]:
+    if values.numel() == 0:
+        return 0.0, 0.0, 0.0
+    return (
+        torch.mean(values).detach().item(),
+        torch.max(values).detach().item(),
+        torch.min(values).detach().item(),
+    )
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -125,10 +135,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     # SUPO: filter to final trajectories only for reward/score metrics.
     # Non-final trajectories have reward=0 by design and would bias metrics downward.
     is_final = batch.non_tensor_batch.get("is_final", None)
-    if is_final is not None:
-        is_final_tensor = torch.tensor(
-            [bool(f) for f in is_final], dtype=torch.bool, device=non_aborted_mask.device
-        )
+    if is_final is not None and any(f is not None for f in is_final):
+        is_final_tensor = torch.tensor([bool(f) for f in is_final], dtype=torch.bool, device=non_aborted_mask.device)
         reward_mask = non_aborted_mask & is_final_tensor
     else:
         reward_mask = non_aborted_mask
@@ -136,63 +144,69 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     non_aborted_sequence_score = sequence_score[reward_mask]
     non_aborted_sequence_reward = sequence_reward[reward_mask]
 
-    score_mean = torch.mean(non_aborted_sequence_score).detach().item()
-    score_max = torch.max(non_aborted_sequence_score).detach().item()
-    score_min = torch.min(non_aborted_sequence_score).detach().item()
-
-    reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
-    reward_max = torch.max(non_aborted_sequence_reward).detach().item()
-    reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+    score_mean, score_max, score_min = _safe_tensor_stats(non_aborted_sequence_score)
+    reward_mean, reward_max, reward_min = _safe_tensor_stats(non_aborted_sequence_reward)
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+    adv_mean, adv_max, adv_min = _safe_tensor_stats(valid_adv)
+    returns_mean, returns_max, returns_min = _safe_tensor_stats(valid_returns)
 
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        values_mean, values_max, values_min = _safe_tensor_stats(valid_values)
+        if valid_returns.numel() > 0 and valid_values.numel() > 0:
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
+            vf_explained_var = (1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
+        else:
+            vf_explained_var = 0.0
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
     aborted_ratio = torch.mean(aborted_mask.float()).detach().item()
 
     non_aborted_response_length = response_length[non_aborted_mask]
+    (
+        non_aborted_response_length_mean,
+        non_aborted_response_length_max,
+        non_aborted_response_length_min,
+    ) = _safe_tensor_stats(non_aborted_response_length)
     if non_aborted_response_length.numel() > 0:
-        non_aborted_response_length_mean = torch.mean(non_aborted_response_length).detach().item()
-        non_aborted_response_length_max = torch.max(non_aborted_response_length).detach().item()
-        non_aborted_response_length_min = torch.min(non_aborted_response_length).detach().item()
         non_aborted_response_length_clip_ratio = (
             torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item()
         )
     else:
-        raise ValueError("All samples are aborted, this should not happen.")
+        non_aborted_response_length_clip_ratio = 0.0
 
     metrics = {
         # score
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
         "critic/score/min": score_min,
+        "critic/score/count": non_aborted_sequence_score.numel(),
         # reward
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        "critic/rewards/count": non_aborted_sequence_reward.numel(),
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": adv_mean,
+        "critic/advantages/max": adv_max,
+        "critic/advantages/min": adv_min,
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": returns_mean,
+        "critic/returns/max": returns_max,
+        "critic/returns/min": returns_min,
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": values_mean,
+                "critic/values/max": values_max,
+                "critic/values/min": values_min,
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": vf_explained_var,
             }
             if use_critic
             else {}
@@ -213,6 +227,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         # aborted ratio
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,
+        "response/non_aborted_count": non_aborted_response_length.numel(),
         # prompt length
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),

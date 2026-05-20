@@ -19,9 +19,10 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
@@ -440,6 +441,72 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _stringify_raw_prompt(self, raw_prompt) -> str:
+        """Render a raw chat prompt for logging when tokenized prompts are not available yet."""
+        if raw_prompt is None:
+            return ""
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if not isinstance(raw_prompt, list):
+            return str(raw_prompt)
+
+        parts = []
+        for message in raw_prompt:
+            if not isinstance(message, dict):
+                parts.append(str(message))
+                continue
+
+            role = message.get("role", "")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        content_parts.append(str(item.get("text") or item.get("content") or item))
+                    else:
+                        content_parts.append(str(item))
+                content = " ".join(content_parts)
+            parts.append(f"{role}: {content}" if role else str(content))
+        return "\n".join(parts)
+
+    def _decode_batch_prompts_for_logging(self, batch: DataProto) -> list[str]:
+        """Decode prompt text before or after rollout.
+
+        Agent-loop datasets keep only raw_prompt before rollout; the tensor key
+        "prompts" is created by rollout output. Validation needs to log expected
+        samples before rollout, so support both representations.
+        """
+        if batch.batch is not None and "prompts" in batch.batch.keys():
+            return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["prompts"]]
+
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+        if raw_prompts is not None:
+            texts = []
+            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+            apply_kwargs.pop("tokenize", None)
+            apply_kwargs.pop("return_dict", None)
+            apply_kwargs.pop("return_tensors", None)
+            for raw_prompt in raw_prompts:
+                if isinstance(raw_prompt, np.ndarray):
+                    raw_prompt = raw_prompt.tolist()
+                try:
+                    texts.append(
+                        self.tokenizer.apply_chat_template(
+                            raw_prompt,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **apply_kwargs,
+                        )
+                    )
+                except Exception:
+                    texts.append(self._stringify_raw_prompt(raw_prompt))
+            return texts
+
+        if batch.batch is not None and "input_ids" in batch.batch.keys():
+            return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["input_ids"]]
+
+        return [""] * len(batch)
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -497,7 +564,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "ability", "code_id"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -554,6 +621,24 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+            expected_val_records = []
+            if self._is_supo:
+                expected_input_texts = self._decode_batch_prompts_for_logging(test_batch)
+                expected_uids = test_batch.non_tensor_batch.get("uid", np.array([None] * len(test_batch), dtype=object))
+                expected_data_sources = test_batch.non_tensor_batch.get(
+                    "data_source", np.array(["unknown"] * len(test_batch), dtype=object)
+                )
+                expected_abilities = test_batch.non_tensor_batch.get(
+                    "ability", np.array([None] * len(test_batch), dtype=object)
+                )
+                for i, item in enumerate(test_batch):
+                    expected_val_records.append({
+                        "uid": expected_uids[i],
+                        "data_source": expected_data_sources[i],
+                        "ability": expected_abilities[i],
+                        "input": expected_input_texts[i],
+                        "gts": item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None),
+                    })
 
             # Non-compressed rollouts collect ground truths here; compressed rollouts collect them after union.
             if not self._is_supo:
@@ -604,6 +689,8 @@ class RayPPOTrainer:
                     target_uids = test_output_gen_batch.non_tensor_batch["uid"]
                     test_batch = expand_batch_by_uid(test_batch, target_uids)
                 self._remove_supo_duplicate_keys(test_batch, test_output_gen_batch)
+            else:
+                self._remove_rollout_passthrough_keys(test_batch, test_output_gen_batch)
 
             # Collect outputs and union
             output_ids = test_output_gen_batch.batch["responses"]
@@ -616,8 +703,7 @@ class RayPPOTrainer:
             reward_tensor, reward_extra_info = extract_reward(test_batch)
 
             # Store original inputs and scores
-            input_ids = test_batch.batch["prompts"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            input_texts = self._decode_batch_prompts_for_logging(test_batch)
             scores_all = reward_tensor.sum(-1).cpu().tolist()
 
             # Use only final segments for compressed-rollout metrics.
@@ -644,6 +730,17 @@ class RayPPOTrainer:
                     dump_extra_infos[k].extend(v)
                 else:
                     dump_extra_infos[k].append(v)
+            for k in ("uid", "ability", "code_id", "data_source", "is_final", "__num_turns__"):
+                if k in test_batch.non_tensor_batch:
+                    v = test_batch.non_tensor_batch[k]
+                    if k not in dump_extra_infos:
+                        dump_extra_infos[k] = []
+                    if isinstance(v, np.ndarray):
+                        dump_extra_infos[k].extend(v.tolist())
+                    elif isinstance(v, list):
+                        dump_extra_infos[k].extend(v)
+                    else:
+                        dump_extra_infos[k].extend([v] * len(input_texts))
 
             # Metrics: final trajectories only (for non-SUPO, final_indices == all_indices)
             sample_inputs.extend([input_texts[i] for i in final_indices])
@@ -669,6 +766,33 @@ class RayPPOTrainer:
                     values_list = [values]
                 reward_extra_infos_dict[key].extend(values_list)
 
+            # SUPO may terminate a rollout as overlong before producing a final trajectory.
+            # Those rollouts still correspond to validation attempts and must count as 0,
+            # otherwise validation accuracy becomes "accuracy among non-overlong rollouts".
+            missing_records = []
+            if self._is_supo and expected_val_records:
+                final_uid_counts = Counter(test_batch.non_tensor_batch["uid"][i] for i in final_indices)
+                for record in expected_val_records:
+                    uid = record["uid"]
+                    if final_uid_counts[uid] > 0:
+                        final_uid_counts[uid] -= 1
+                    else:
+                        missing_records.append(record)
+
+                if missing_records:
+                    sample_inputs.extend([record["input"] for record in missing_records])
+                    sample_outputs.extend(["[overlong]"] * len(missing_records))
+                    sample_gts.extend([record["gts"] for record in missing_records])
+                    sample_scores.extend([0.0] * len(missing_records))
+                    sample_uids.extend([record["uid"] for record in missing_records])
+                    reward_extra_infos_dict["reward"].extend([0.0] * len(missing_records))
+
+                    for key in reward_extra_info.keys():
+                        if key not in reward_extra_infos_dict:
+                            reward_extra_infos_dict[key] = []
+                        default_val = 0.0 if key in ("acc", "score", "judge_correct", "judge_parse_error") else None
+                        reward_extra_infos_dict[key].extend([default_val] * len(missing_records))
+
             # collect num_turns of each prompt (final only)
             if "__num_turns__" in test_batch.non_tensor_batch:
                 num_turns = test_batch.non_tensor_batch["__num_turns__"]
@@ -683,6 +807,10 @@ class RayPPOTrainer:
                 data_source_lst.append(data_sources[final_indices])
             else:
                 data_source_lst.append([data_sources[i] for i in final_indices])
+
+            if missing_records:
+                sample_turns.append(np.zeros(len(missing_records), dtype=np.int32))
+                data_source_lst.append(np.array([record["data_source"] for record in missing_records], dtype=object))
             
             # Collect trajectory split statistics.
             if self._is_supo and "rollout_id" in test_batch.non_tensor_batch and "traj_idx" in test_batch.non_tensor_batch:
@@ -748,6 +876,7 @@ class RayPPOTrainer:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
+            metric_data_source = "codegym" if str(data_source).startswith("codegym") else data_source
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
@@ -760,7 +889,7 @@ class RayPPOTrainer:
                         metric_sec = "val-core"
                     else:
                         metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    pfx = f"{metric_sec}/{metric_data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
         if len(sample_turns) > 0:
@@ -776,12 +905,19 @@ class RayPPOTrainer:
         "uid", "data_source", "reward_model", "is_padding",
         "traj_idx", "is_final", "rollout_id", "overlong",
     ]
+    _ROLLOUT_PASSTHROUGH_KEYS = ["uid", "data_source", "reward_model", "extra_info", "ability", "code_id", "is_padding"]
 
     def _remove_supo_duplicate_keys(self, src_batch, gen_batch):
         """Remove keys from src_batch that already exist in gen_batch to avoid union conflicts."""
         for key in self._SUPO_DUPLICATE_KEYS:
             if key in src_batch.non_tensor_batch and key in gen_batch.non_tensor_batch:
                 del src_batch.non_tensor_batch[key]
+
+    def _remove_rollout_passthrough_keys(self, src_batch, gen_batch):
+        """Keep original dataset metadata when non-SUPO rollout returns the same pass-through keys."""
+        for key in self._ROLLOUT_PASSTHROUGH_KEYS:
+            if key in src_batch.non_tensor_batch and key in gen_batch.non_tensor_batch:
+                del gen_batch.non_tensor_batch[key]
 
     def _log_supo_val_stats(self, gen_batch, test_batch_pre, stage="post-rollout"):
         """SUPO diagnostic logging for validation flow (console only, metrics are in supo_stats)."""
@@ -1241,7 +1377,22 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
+    def _get_worker_group_dp_size(self, worker_group, mesh_name: str) -> int:
+        if mesh_name not in worker_group._dispatch_info:
+            worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+        return max(worker_group._dispatch_info[mesh_name]) + 1
+
+    def _pad_supo_to_worker_dp(self, batch: DataProto, worker_group, mesh_name: str) -> tuple[DataProto, int]:
+        if not self._is_supo:
+            return batch, 0
+        dp_size = self._get_worker_group_dp_size(worker_group, mesh_name)
+        if dp_size <= 1:
+            return batch, 0
+        return pad_dataproto_to_divisor(batch, dp_size)
+
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        ref_worker_group = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+        batch, supo_pad_size = self._pad_supo_to_worker_dp(batch, ref_worker_group, "actor")
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1266,9 +1417,11 @@ class RayPPOTrainer:
         else:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
+        ref_log_prob = unpad_dataproto(ref_log_prob, supo_pad_size)
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        batch, supo_pad_size = self._pad_supo_to_worker_dp(batch, self.actor_rollout_wg, "actor")
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1295,6 +1448,7 @@ class RayPPOTrainer:
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
+        old_log_prob = unpad_dataproto(old_log_prob, supo_pad_size)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1509,6 +1663,8 @@ class RayPPOTrainer:
                         for key in self._SUPO_DUPLICATE_KEYS:
                             if key in batch.non_tensor_batch and key in gen_batch_output.non_tensor_batch:
                                 del batch.non_tensor_batch[key]
+                    else:
+                        self._remove_rollout_passthrough_keys(batch, gen_batch_output)
 
                     batch = batch.union(gen_batch_output)
 
@@ -1662,7 +1818,9 @@ class RayPPOTrainer:
                         if self._is_supo:
                             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
                             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch, supo_pad_size = pad_supo_dummy_trajectories(batch, ppo_mini_batch_size)
+                            actor_dp_size = self._get_worker_group_dp_size(self.actor_rollout_wg, "actor")
+                            supo_pad_divisor = math.lcm(ppo_mini_batch_size, actor_dp_size)
+                            batch, supo_pad_size = pad_supo_dummy_trajectories(batch, supo_pad_divisor)
                             if supo_pad_size > 0:
                                 metrics["train/supo/dummy_pad_size"] = supo_pad_size
                         
