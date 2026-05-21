@@ -370,6 +370,7 @@ def compute_supo_advantage(
     echo_selected_turn_ids: np.ndarray | None = None,
     echo_response_turn_ids: np.ndarray | None = None,
     echo_response_finding_turn_ids: np.ndarray | None = None,
+    echo_response_selection_mask: np.ndarray | None = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -400,6 +401,8 @@ def compute_supo_advantage(
             if echo_response_turn_ids is not None else None
         response_finding_turn_arr = np.asarray(echo_response_finding_turn_ids, dtype=object) \
             if echo_response_finding_turn_ids is not None else None
+        response_selection_mask_arr = np.asarray(echo_response_selection_mask, dtype=object) \
+            if echo_response_selection_mask is not None else None
         credit_mode = str(getattr(config, "echo_credit_method", "none") or "none").lower()
         valid_credit_modes = {"none", "token", "traj", "traj-turn"}
         if credit_mode not in valid_credit_modes:
@@ -439,6 +442,15 @@ def compute_supo_advantage(
                 if len(turn_ids_list) < response_mask.shape[1]:
                     turn_ids_list = turn_ids_list + [-1] * (response_mask.shape[1] - len(turn_ids_list))
             return torch.tensor(turn_ids_list[: response_mask.shape[1]], device=response_mask.device)
+
+        def _to_bool_tensor(value) -> torch.Tensor:
+            if value is None:
+                mask_list = [0] * response_mask.shape[1]
+            else:
+                mask_list = value.tolist() if isinstance(value, np.ndarray) else list(value)
+                if len(mask_list) < response_mask.shape[1]:
+                    mask_list = mask_list + [0] * (response_mask.shape[1] - len(mask_list))
+            return torch.tensor(mask_list[: response_mask.shape[1]], device=response_mask.device).bool()
 
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
@@ -511,6 +523,8 @@ def compute_supo_advantage(
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             adv = rollout_to_advantage.get(rid, 0.0)
+            reward = rollout_to_reward.get(rid, 0.0)
+            is_positive_rollout = reward > positive_reward_threshold
             bonus_vec = torch.zeros_like(response_mask[i, :], dtype=torch.float32)
             credit_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
             rollout_has_credit_target = False
@@ -534,7 +548,18 @@ def compute_supo_advantage(
                         credit_mask |= turn_ids_tensor.eq(int(turn_id)) | finding_turn_ids_tensor.eq(int(turn_id))
                     credit_mask &= response_mask[i, :].bool()
 
+            if credit_mode in ("token", "traj-turn") and response_selection_mask_arr is not None:
+                selection_mask_tensor = _to_bool_tensor(response_selection_mask_arr[i])
+                credit_mask |= selection_mask_tensor & response_mask[i, :].bool()
+                rollout_has_credit_target = rollout_has_credit_target or bool(selection_mask_tensor.any().item())
+
+            if is_positive_rollout and is_final_arr[i]:
+                credit_mask |= response_mask[i, :].bool()
+
             if use_penalty_ratio and rollout_has_credit_target:
+                if not is_positive_rollout:
+                    advantages[i, :] = torch.zeros_like(response_mask[i, :], dtype=torch.float32)
+                    continue
                 weight_vec = torch.full_like(response_mask[i, :], penalty_ratio, dtype=torch.float32)
                 weight_vec[credit_mask] = 1.0
                 advantages[i, :] = adv * response_mask[i, :].float() * weight_vec
@@ -543,7 +568,7 @@ def compute_supo_advantage(
             if (
                 selected_bonus > 0.0
                 # Gate only the ECHO extra credit; SUPO rollout-level advantage is unchanged.
-                and rollout_to_reward.get(rid, 0.0) > positive_reward_threshold
+                and is_positive_rollout
                 and credit_mode != "none"
             ):
                 if is_final_arr[i]:

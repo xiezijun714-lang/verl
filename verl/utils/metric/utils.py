@@ -22,32 +22,40 @@ import numpy as np
 import torch
 
 
-def _flatten_numeric_metric_values(value: Any) -> list[float]:
+def _flatten_numeric_metric(value: Any) -> list[float]:
     if isinstance(value, Metric):
         value = value.aggregate()
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
             return []
-        return value.detach().float().cpu().reshape(-1).tolist()
+        value = value.detach().float().cpu().reshape(-1)
+        return [float(item) for item in value.tolist()]
     if isinstance(value, np.ndarray):
         if value.size == 0:
             return []
         if value.dtype == object:
-            values = []
-            for item in value.flat:
-                values.extend(_flatten_numeric_metric_values(item))
-            return values
-        return value.astype(float).reshape(-1).tolist()
-    if isinstance(value, np.number):
+            flattened = []
+            for item in value.reshape(-1).tolist():
+                flattened.extend(_flatten_numeric_metric(item))
+            return flattened
+        return [float(item) for item in value.astype(np.float32).reshape(-1).tolist()]
+    if isinstance(value, np.generic):
         return [float(value)]
     if isinstance(value, (int, float)):
         return [float(value)]
     if isinstance(value, (list, tuple)):
-        values = []
+        flattened = []
         for item in value:
-            values.extend(_flatten_numeric_metric_values(item))
-        return values
+            flattened.extend(_flatten_numeric_metric(item))
+        return flattened
     return []
+
+
+def normalize_metric_value(value: Any) -> float:
+    values = _flatten_numeric_metric(value)
+    if not values:
+        return 0.0
+    return float(np.mean(values))
 
 
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
@@ -76,7 +84,7 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
     """
     reduced_metrics = {}
     for key, val in metrics.items():
-        values = _flatten_numeric_metric_values(val)
+        values = _flatten_numeric_metric(val)
         if not values:
             continue
         if "max" in key:

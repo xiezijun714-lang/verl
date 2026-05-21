@@ -20,38 +20,9 @@ import os
 from typing import Any, Optional
 
 import ray
-import sglang
-import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
 from ray.actor import ActorHandle
-from sglang.srt.entrypoints.http_server import (
-    ServerArgs,
-    _GlobalState,
-    _launch_subprocesses,
-    app,
-    set_global_state,
-)
-from sglang.srt.managers.io_struct import (
-    GenerateReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
-try:
-    from sglang.srt.managers.io_struct import (
-        ContinueGenerationReqInput,
-        PauseGenerationReqInput,
-    )
-    _has_pause_resume = True
-except ImportError:
-    _has_pause_resume = False
-try:
-    from sglang.srt.managers.tokenizer_manager import ServerStatus
-except ImportError:
-    import enum
-    class ServerStatus(enum.Enum):
-        Up = "up"
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
@@ -59,13 +30,92 @@ from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+sglang = None
+ServerArgs = None
+_GlobalState = None
+_launch_subprocesses = None
+app = None
+set_global_state = None
+GenerateReqInput = None
+ReleaseMemoryOccupationReqInput = None
+ResumeMemoryOccupationReqInput = None
+ContinueGenerationReqInput = None
+PauseGenerationReqInput = None
+ServerStatus = None
+_set_envs_and_config = None
+_has_pause_resume = None
+
+
+def _lazy_import_sglang():
+    """Import SGLang after CUDA visibility has been fixed inside the server actor."""
+    global sglang
+    global ServerArgs, _GlobalState, _launch_subprocesses, app, set_global_state
+    global GenerateReqInput, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput
+    global ContinueGenerationReqInput, PauseGenerationReqInput, ServerStatus
+    global _set_envs_and_config, _has_pause_resume
+
+    if sglang is not None:
+        return
+
+    import enum
+    import sglang as sglang_module
+    import sglang.srt.entrypoints.engine  # noqa: F401
+    from sglang.srt.entrypoints.http_server import (
+        ServerArgs as ServerArgs_,
+        _GlobalState as _GlobalState_,
+        _launch_subprocesses as _launch_subprocesses_,
+        app as app_,
+        set_global_state as set_global_state_,
+    )
+    from sglang.srt.managers.io_struct import (
+        GenerateReqInput as GenerateReqInput_,
+        ReleaseMemoryOccupationReqInput as ReleaseMemoryOccupationReqInput_,
+        ResumeMemoryOccupationReqInput as ResumeMemoryOccupationReqInput_,
+    )
+    from verl.workers.rollout.sglang_rollout.sglang_rollout import (
+        _set_envs_and_config as _set_envs_and_config_,
+    )
+
+    try:
+        from sglang.srt.managers.io_struct import (
+            ContinueGenerationReqInput as ContinueGenerationReqInput_,
+            PauseGenerationReqInput as PauseGenerationReqInput_,
+        )
+
+        has_pause_resume = True
+    except ImportError:
+        ContinueGenerationReqInput_ = None
+        PauseGenerationReqInput_ = None
+        has_pause_resume = False
+
+    try:
+        from sglang.srt.managers.tokenizer_manager import ServerStatus as ServerStatus_
+    except ImportError:
+
+        class ServerStatus_(enum.Enum):
+            Up = "up"
+
+    sglang = sglang_module
+    ServerArgs = ServerArgs_
+    _GlobalState = _GlobalState_
+    _launch_subprocesses = _launch_subprocesses_
+    app = app_
+    set_global_state = set_global_state_
+    GenerateReqInput = GenerateReqInput_
+    ReleaseMemoryOccupationReqInput = ReleaseMemoryOccupationReqInput_
+    ResumeMemoryOccupationReqInput = ResumeMemoryOccupationReqInput_
+    ContinueGenerationReqInput = ContinueGenerationReqInput_
+    PauseGenerationReqInput = PauseGenerationReqInput_
+    ServerStatus = ServerStatus_
+    _set_envs_and_config = _set_envs_and_config_
+    _has_pause_resume = has_pause_resume
 
 
 class SGLangHttpServer:
@@ -162,6 +212,7 @@ class SGLangHttpServer:
         return self._server_address, self._server_port
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
+        _lazy_import_sglang()
         if self.nnodes > 1:
             if self.node_rank != 0:
                 assert master_address and master_port, "non-master node should provide master address and port"
@@ -312,6 +363,7 @@ class SGLangHttpServer:
         self.tokenizer_manager.server_status = ServerStatus.Up
 
     async def wake_up(self):
+        _lazy_import_sglang()
         if self.node_rank != 0:
             return
 
@@ -327,6 +379,7 @@ class SGLangHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        _lazy_import_sglang()
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
@@ -352,6 +405,7 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        _lazy_import_sglang()
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
@@ -398,13 +452,15 @@ class SGLangHttpServer:
         generate_request = GenerateReqInput(**request)
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
-        finish_reason = output["meta_info"]["finish_reason"]
+        meta_info = output["meta_info"]
+        finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
         if return_logprob:
-            output_token_logprobs = output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
-                *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
+                *[(log_prob, token_id) for log_prob, token_id, _ in meta_info["output_token_logprobs"]], strict=True
             )
+            log_probs = list(log_probs)
+            token_ids = list(token_ids)
         else:
             token_ids = output["output_ids"]
             log_probs = None
@@ -440,11 +496,13 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
+        _lazy_import_sglang()
         if _has_pause_resume:
             await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
         # sglang < 0.5.0: no pause/resume API, weights update is synchronous
 
     async def resume_generation(self):
+        _lazy_import_sglang()
         if _has_pause_resume:
             await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 

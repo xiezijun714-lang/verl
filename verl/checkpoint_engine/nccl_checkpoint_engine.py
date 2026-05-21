@@ -16,11 +16,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import AsyncGenerator, Generator
+from typing import Any, AsyncGenerator, Generator
 from unittest.mock import patch
 
-with patch("importlib.metadata.distributions", return_value=[]):
-    import cupy as cp
+try:
+    with patch("importlib.metadata.distributions", return_value=[]):
+        import cupy as cp
+except ImportError:
+    cp = None
 
 import ray
 import ray.util.collective as collective
@@ -56,7 +59,7 @@ class BroadcastOperation:
         self,
         rank: int,
         group_name: str,
-        bucket: cp.ndarray | torch.Tensor,
+        bucket: Any,
         metadata: dict[str, TensorMeta],
         socket: zmq.Socket,
         topic: str,
@@ -127,8 +130,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def prepare(self) -> MasterMetadata:
         # For master process, use cupy instead of torch to avoid memory register error
-        # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-        if self.is_master:
+        # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Fall back to torch
+        # when cupy is not installed; registration should not depend on optional cupy.
+        if self.is_master and cp is not None:
             self.send_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
             self.recv_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
         else:
@@ -274,7 +278,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 "dtype": weight.dtype,
                 "offset": offset,
             }
-            send_buf[offset : offset + weight.nbytes] = cp.asarray(weight.view(-1).view(torch.uint8))
+            weight_bytes = weight.view(-1).view(torch.uint8)
+            if cp is not None and not isinstance(send_buf, torch.Tensor):
+                send_buf[offset : offset + weight.nbytes] = cp.asarray(weight_bytes)
+            else:
+                send_buf[offset : offset + weight.nbytes].copy_(weight_bytes)
             offset += weight.nbytes
 
         # broadcast last bucket

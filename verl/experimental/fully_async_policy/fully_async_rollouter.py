@@ -26,6 +26,7 @@ import torch
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
+    is_task_cancelled_exception,
     prepare_single_generation_data,
     safe_create_task,
 )
@@ -89,6 +90,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.kl_ctrl_in_reward = False
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        adv_estimator = self.config.algorithm.adv_estimator
+        self._is_supo = adv_estimator == "supo" or (
+            hasattr(adv_estimator, "value") and adv_estimator.value == "supo"
+        )
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # ==================== fully async config ====================
@@ -166,6 +171,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
+        self.param_sync_paused = False
         self.running = True
 
         # Add dataloader lock
@@ -240,6 +246,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Returns timing_raw dictionary for metrics.
         """
         async with self.lock:
+            self.param_sync_paused = False
             self.paused = False
             self.condition.notify_all()
             # every time param change, reset staleness_samples
@@ -258,6 +265,36 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
+        return timing_raw
+
+    async def pause_and_drain(self):
+        """Pause new rollout work and wait for in-flight rollout tasks before weight sync."""
+        start_time = time.time()
+        drained_tasks = 0
+
+        async with self.lock:
+            self.param_sync_paused = True
+            self.paused = True
+
+        while True:
+            async with self.lock:
+                if not self.active_tasks:
+                    break
+                done_tasks, self.active_tasks = await asyncio.wait(
+                    self.active_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                drained_tasks += len(done_tasks)
+                await self._await_finished_tasks(done_tasks)
+
+        timing_raw = {
+            "timing_s/rollouter_pause_and_drain": time.time() - start_time,
+            "fully_async/rollouter/drained_tasks": drained_tasks,
+        }
+        print(
+            "[FullyAsyncRollouter][Public][pause_and_drain] "
+            f"drained_tasks: {drained_tasks}, "
+            f"elapsed: {timing_raw['timing_s/rollouter_pause_and_drain']:.4f} seconds"
+        )
         return timing_raw
 
     def do_validate(self) -> ValidateMetrics:
@@ -430,6 +467,31 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         await self.pending_queue.put(None)
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
+    async def _await_finished_tasks(self, done_tasks: set[asyncio.Task]):
+        for task in done_tasks:
+            try:
+                await task
+            except BaseException as e:
+                if is_task_cancelled_exception(e):
+                    self.dropped_stale_samples += 1
+                    self.processed_sample_count += 1
+                    print(
+                        f"[FullyAsyncRollouter][Processor] Task {task.get_name()} was cancelled, "
+                        f"drop it as an in-flight stale sample. "
+                        f"dropped_stale_samples: {self.dropped_stale_samples}"
+                    )
+                    continue
+                raise
+
+    def _raise_unexpected_task_exception(self, task: asyncio.Task):
+        try:
+            exc = task.exception()
+        except BaseException as e:
+            exc = e
+        if exc is None or is_task_cancelled_exception(exc):
+            return
+        raise exc
+
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
@@ -448,8 +510,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                            for task in done_tasks:
-                                await task
+                            await self._await_finished_tasks(done_tasks)
 
                 async with self.lock:
                     while self.paused:
@@ -471,8 +532,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                            for task in done_tasks:
-                                await task
+                            await self._await_finished_tasks(done_tasks)
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
@@ -482,8 +542,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         done_tasks, self.active_tasks = await asyncio.wait(
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
-                        for task in done_tasks:
-                            await task
+                        await self._await_finished_tasks(done_tasks)
 
             # Submit single sample processing
             async with self.lock:
@@ -538,8 +597,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
             for task in done:
-                if task.exception():
-                    raise task.exception()
+                self._raise_unexpected_task_exception(task)
 
             if self.feed_task not in done:
                 raise RuntimeError("Processor task exited prematurely")
@@ -569,11 +627,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.feed_task = None
             self.processor_task = None
 
+            async with self.lock:
+                self.running = False
+                self.param_sync_paused = False
+                self.paused = False
+                self.condition.notify_all()
+
             # Send a finish signal
             await self.message_queue_client.put_sample(sample=None)
-
-        async with self.lock:
-            self.running = False
 
     async def fit(self):
         """
@@ -588,6 +649,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Set the running status flag
         async with self.lock:
+            self.param_sync_paused = False
             self.paused = False
             self.running = True
 
@@ -597,9 +659,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         try:
             # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            results = await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not is_task_cancelled_exception(result):
+                    raise result
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            raise
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -634,7 +700,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.paused and not await self._should_pause_generation():
+            if self.paused and not self.param_sync_paused and not await self._should_pause_generation():
                 async with self.lock:
                     self.paused = False
                     print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")

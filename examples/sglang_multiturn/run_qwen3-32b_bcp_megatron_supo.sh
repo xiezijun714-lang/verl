@@ -59,66 +59,64 @@ export RAY_raylet_start_wait_time_s=120
 RAY_HEAD_PORT_ARGS="--dashboard-agent-grpc-port=28101 --dashboard-agent-listen-port=28102 --metrics-export-port=28103"
 RAY_WORKER_PORT_ARGS="--dashboard-agent-grpc-port=28001 --dashboard-agent-listen-port=28002 --metrics-export-port=28003"
 
-MODEL_PATH="/root/paddlejob/workspace/env_run/xzj/models/Qwen3-32B"
-MODEL_CONTEXT_LIMIT=40960
-DATA_DIR="/root/paddlejob/workspace/env_run/xzj/dataset/browsecomp-plus-processed"
-TRAIN_FILE="${DATA_DIR}/train.paper.parquet"
-VAL_FILE="${DATA_DIR}/test.paper.parquet"
-TOOL_CONFIG_PATH="${PROJECT_DIR}/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml"
+MODEL_PATH="${MODEL_PATH:-/root/paddlejob/workspace/env_run/xzj/models/Qwen3-32B}"
+MODEL_CONTEXT_LIMIT=${MODEL_CONTEXT_LIMIT:-40960}
+DATA_DIR="${DATA_DIR:-/root/paddlejob/workspace/env_run/xzj/dataset/browsecomp-plus-processed}"
+TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.paper.parquet}
+VAL_FILE=${VAL_FILE:-${DATA_DIR}/test.paper.parquet}
+TOOL_CONFIG_PATH="${TOOL_CONFIG_PATH:-${PROJECT_DIR}/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml}"
 
 # ---- Batch sizes ----
-TRAIN_BATCH_SIZE=32
-N_RESP=8
-ACTOR_PPO_MICRO_BSZ=2
-LOG_PROB_MICRO_BSZ=2
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+N_RESP=${N_RESP:-8}
+ACTOR_PPO_MICRO_BSZ=${ACTOR_PPO_MICRO_BSZ:-2}
+LOG_PROB_MICRO_BSZ=${LOG_PROB_MICRO_BSZ:-2}
 
 # ---- Parallelism ----
 # On 8x8 GPUs, keep one 32-GPU model-parallel group and use DP=2.
-ACTOR_TP=8
-ACTOR_PP=2
+ACTOR_TP=${ACTOR_TP:-8}
+ACTOR_PP=${ACTOR_PP:-2}
 ACTOR_VPP=null
-ACTOR_CP=2
+ACTOR_CP=${ACTOR_CP:-2}
 
-REF_TP=8
-REF_PP=2
+REF_TP=${REF_TP:-8}
+REF_PP=${REF_PP:-2}
 REF_VPP=null
-REF_CP=2
+REF_CP=${REF_CP:-2}
 
-ROLLOUT_TP=8
+ROLLOUT_TP=${ROLLOUT_TP:-8}
 
 # ---- Sequence lengths ----
-MAX_PROMPT_LENGTH=4096
-MAX_RESPONSE_LENGTH=32768
-MAX_TOOL_RESPONSE_LENGTH=16000
-MAX_PARALLEL_CALLS=5
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-32768}
+MAX_TOOL_RESPONSE_LENGTH=${MAX_TOOL_RESPONSE_LENGTH:-16000}
+MAX_PARALLEL_CALLS=${MAX_PARALLEL_CALLS:-5}
 
 # ---- SUPO Configuration ----
 # working_context_length: single-segment threshold to trigger summarization
 # max_model_len: SGLang KV cache size
 # max_summary_rounds: how many times to summarize before marking as overlong
-WORKING_CONTEXT_LENGTH=32768
-MAX_SUMMARY_ROUNDS=5
+WORKING_CONTEXT_LENGTH=${WORKING_CONTEXT_LENGTH:-32768}
+MAX_SUMMARY_ROUNDS=${MAX_SUMMARY_ROUNDS:-5}
 # Qwen3-32B local config has max_position_embeddings=40960.
 # Keep this <=40960 unless the model config/rope scaling is changed.
-MAX_MODEL_LEN=40960
-CONTEXT_COMPRESSION_METHOD="${CONTEXT_COMPRESSION_METHOD:-summary}"
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
+CONTEXT_COMPRESSION_METHOD=${CONTEXT_COMPRESSION_METHOD:-summary}
 
-ROLLOUT_GPU_MEMORY_UTILIZATION=0.35
-ROLLOUT_MAX_NUM_SEQS=32
-SGLANG_CHUNKED_PREFILL_SIZE=8192
-SGLANG_MAX_PREFILL_TOKENS=32768
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.35}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
+SGLANG_CHUNKED_PREFILL_SIZE=${SGLANG_CHUNKED_PREFILL_SIZE:-8192}
+SGLANG_MAX_PREFILL_TOKENS=${SGLANG_MAX_PREFILL_TOKENS:-32768}
 BCP_SUMMARY_INSTRUCTION=${BCP_SUMMARY_INSTRUCTION:-$'System:\nYour operational context is full. Generate a concise summary by populating the template below.\nThis summary will be your sole context for continuing this task. Be brief but ensure all critical data is present.\n\nRules:\n- Output exactly one <summary>...</summary> block.\n- Do not call any function/tool in this turn.\n- Do not include <think>, tool calls, markdown fences, or text outside the summary tags.\n\n<summary>\nMission Objective:\n- Original query: [State the user verbatim query.]\n- Verification checklist:\n  - [VERIFIED/PENDING]: [Checklist item]\n\nKey Findings:\n- Sources:\n  - [Critical verified fact with source docid]\n- Discrepancies:\n  - [Conflicting information or uncertainty]\n\nTactical Plan:\n- Promising leads:\n  - [Best remaining keywords, sources, or angles]\n- Known dead ends:\n  - [Queries or sources that proved useless]\n- Immediate next action:\n  - [Exact tool call or query to execute next]\n</summary>'}
-EXPERIMENT_NAME="${BCP_EXPERIMENT_NAME:-qwen3-32b-bcp-supo-32k}"
-CKPT_DIR="${PROJECT_DIR}/ckpt/${EXPERIMENT_NAME}"
-VALIDATION_DATA_DIR="${PROJECT_DIR}/val_outputs"
+EXPERIMENT_NAME="${BCP_EXPERIMENT_NAME:-${EXPERIMENT_NAME:-qwen3-32b_bcp_megatron-supo-32k}}"
+CKPT_DIR="${CKPT_DIR:-${PROJECT_DIR}/ckpt/${EXPERIMENT_NAME}}"
+VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-${PROJECT_DIR}/val_outputs}"
 
 TOKEN_BUDGET=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 BASE_ACTOR_TOKEN_BUDGET_PER_GPU=$(((TOKEN_BUDGET + ACTOR_CP - 1) / ACTOR_CP))
 BASE_REF_TOKEN_BUDGET_PER_GPU=$(((TOKEN_BUDGET + REF_CP - 1) / REF_CP))
-TOKEN_BUDGET_SCALE_NUM=4
-TOKEN_BUDGET_SCALE_DEN=3
-ACTOR_TOKEN_BUDGET_PER_GPU=$(((BASE_ACTOR_TOKEN_BUDGET_PER_GPU * TOKEN_BUDGET_SCALE_NUM + TOKEN_BUDGET_SCALE_DEN - 1) / TOKEN_BUDGET_SCALE_DEN))
-REF_TOKEN_BUDGET_PER_GPU=$(((BASE_REF_TOKEN_BUDGET_PER_GPU * TOKEN_BUDGET_SCALE_NUM + TOKEN_BUDGET_SCALE_DEN - 1) / TOKEN_BUDGET_SCALE_DEN))
+ACTOR_TOKEN_BUDGET_PER_GPU=${ACTOR_TOKEN_BUDGET_PER_GPU:-${BASE_ACTOR_TOKEN_BUDGET_PER_GPU}}
+REF_TOKEN_BUDGET_PER_GPU=${REF_TOKEN_BUDGET_PER_GPU:-${BASE_REF_TOKEN_BUDGET_PER_GPU}}
 
 TOTAL_GPUS=$((NNODES * 8))
 ACTOR_MODEL_PARALLEL_SIZE=$((ACTOR_TP * ACTOR_PP * ACTOR_CP))
@@ -148,7 +146,10 @@ echo "[config] parallel: actor TP/PP/CP=${ACTOR_TP}/${ACTOR_PP}/${ACTOR_CP} DP=$
 echo "[config] micro bsz: actor=${ACTOR_PPO_MICRO_BSZ}, log_prob=${LOG_PROB_MICRO_BSZ}"
 echo "[config] token budget per GPU: actor=${ACTOR_TOKEN_BUDGET_PER_GPU} (base=${BASE_ACTOR_TOKEN_BUDGET_PER_GPU}), ref=${REF_TOKEN_BUDGET_PER_GPU} (base=${BASE_REF_TOKEN_BUDGET_PER_GPU})"
 
-sed -i -E "s#http://[^/]+:8000/(retrieve|get_doc)#http://${HEAD_IP}:8000/\1#g" "$TOOL_CONFIG_PATH"
+DATA_TOOL_CONFIG_OVERRIDES=(+data.tool_config_path="$TOOL_CONFIG_PATH")
+if [ "${INJECT_DATA_TOOL_SCHEMAS:-True}" = "False" ]; then
+    DATA_TOOL_CONFIG_OVERRIDES=(data.tool_config_path=null)
+fi
 
 # ---- Sync run script and critical files to worker nodes ----
 echo "[sync] Syncing run script and BCP integration files to worker nodes ..."
@@ -163,8 +164,12 @@ SYNC_FILES=(
     "${PROJECT_DIR}/verl/experimental/agent_loop/tool_agent_loop.py"
     "${PROJECT_DIR}/verl/experimental/agent_loop/tool_parser.py"
     "${PROJECT_DIR}/verl/workers/config/rollout.py"
-    "${PROJECT_DIR}/verl/trainer/ppo/core_algos.py"
+    "${PROJECT_DIR}/verl/protocol.py"
     "${PROJECT_DIR}/verl/trainer/ppo/ray_trainer.py"
+    "${PROJECT_DIR}/verl/trainer/ppo/core_algos.py"
+    "${PROJECT_DIR}/verl/utils/metric/utils.py"
+    "${PROJECT_DIR}/verl/workers/actor/megatron_actor.py"
+    "${PROJECT_DIR}/verl/workers/critic/megatron_critic.py"
     "${PROJECT_DIR}/verl/tools/search_tool.py"
     "${PROJECT_DIR}/verl/tools/open_page_tool.py"
     "${PROJECT_DIR}/verl/tools/finish_tool.py"
@@ -261,7 +266,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=False \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.enable_thinking=True \
-    +data.tool_config_path="$TOOL_CONFIG_PATH" \
+    "${DATA_TOOL_CONFIG_OVERRIDES[@]}" \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${VAL_FILE} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
@@ -306,8 +311,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=${MAX_PARALLEL_CALLS} \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH} \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
-    +actor_rollout_ref.rollout.multi_turn.inject_tool_schemas=True \
-    actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml" \
+    +actor_rollout_ref.rollout.multi_turn.inject_tool_schemas=${INJECT_ROLLOUT_TOOL_SCHEMAS:-True} \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path="$TOOL_CONFIG_PATH" \
     +actor_rollout_ref.rollout.multi_turn.enable_summarization=True \
     +actor_rollout_ref.rollout.multi_turn.context_compression_method=${CONTEXT_COMPRESSION_METHOD} \
     +actor_rollout_ref.rollout.multi_turn.max_summary_rounds=${MAX_SUMMARY_ROUNDS} \
@@ -332,8 +337,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.logger='["console", "wandb"]' \
-    trainer.save_freq=10 \
-    trainer.test_freq=5 \
+    trainer.save_freq=${SAVE_FREQ:-10} \
+    trainer.test_freq=${TEST_FREQ:-5} \
     trainer.total_epochs=5 \
     +trainer.master_port_range='[31000,32000]' \
     +trainer.validation_data_dir="${VALIDATION_DATA_DIR}"

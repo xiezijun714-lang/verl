@@ -882,6 +882,7 @@ class AgentLoopWorker:
         default_extra_keys = {
             "turn_scores",
             "tool_rewards",
+            "global_steps",
             "min_global_steps",
             "max_global_steps",
             "extras",
@@ -895,6 +896,7 @@ class AgentLoopWorker:
             "echo_selected_turn_ids",
             "echo_response_turn_ids",
             "echo_response_finding_turn_ids",
+            "echo_response_selection_mask",
             "is_padding",
             "reward_model",
             "data_source",

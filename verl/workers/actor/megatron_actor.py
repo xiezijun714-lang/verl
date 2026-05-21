@@ -50,6 +50,7 @@ from verl.utils.megatron.router_replay_utils import (
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
+from verl.utils.metric.utils import normalize_metric_value
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -818,7 +819,7 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            data = {"actor/grad_norm": grad_norm}
+            data = {"actor/grad_norm": normalize_metric_value(grad_norm)}
             append_to_dict(metrics, data)
 
             if update_successful:

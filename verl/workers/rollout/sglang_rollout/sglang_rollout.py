@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
-from typing import Generator
+from typing import Generator, Optional
 
 import ray
 import sglang.srt.entrypoints.engine
@@ -45,6 +45,71 @@ from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_server_runtime_option(config: RolloutConfig, attr: str, env_name: str, default):
+    value = os.getenv(env_name)
+    if value is None:
+        value = default
+    return type(default)(value)
+
+
+async def _sgl_update_weights_no_flush(
+    engine: AsyncHttpServerAdapter,
+    params_batch: list[tuple[str, torch.Tensor]],
+    device_mesh_key: str,
+    device_mesh: DeviceMesh,
+    load_format: Optional[str] = None,
+):
+    import torch.distributed as dist
+    from sglang.srt.managers.tokenizer_manager import UpdateWeightsFromTensorReqInput
+    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+    from sglang.srt.patch_torch import monkey_patch_torch_reductions
+    from sglang.srt.utils import MultiprocessingSerializer
+    from torch.distributed.tensor import DTensor
+
+    infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
+    infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
+    monkey_patch_torch_reductions()
+
+    named_tensors_batch = [
+        (
+            name,
+            MultiprocessingSerializer.serialize(tensor.full_tensor() if isinstance(tensor, DTensor) else tensor),
+        )
+        for name, tensor in params_batch
+    ]
+
+    if infer_tp_rank == 0:
+        gathered_serialized_batches = [None for _ in range(infer_tp_size)]
+    else:
+        gathered_serialized_batches = None
+
+    dist.gather_object(
+        obj=named_tensors_batch,
+        object_gather_list=gathered_serialized_batches,
+        dst=device_mesh[device_mesh_key].mesh.tolist()[0],
+        group=device_mesh[device_mesh_key].get_group(),
+    )
+
+    if infer_tp_rank == 0:
+        logical_tensors = zip(*gathered_serialized_batches, strict=True)
+        named_tensors = [
+            (
+                tensor_group[0][0],
+                LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]),
+            )
+            for tensor_group in logical_tensors
+        ]
+        update_weights_request = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
+            ],
+            load_format=load_format,
+            flush_cache=False,
+            abort_all_requests=True,
+        )
+        return await engine.update_weights_from_tensor(update_weights_request)
 
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
@@ -165,6 +230,9 @@ class ServerAdapter(BaseRollout):
             host=host,
             port=server_port,
             launch_server=False,
+            timeout=_get_server_runtime_option(self.config, "timeout", "SGLANG_SERVER_TIMEOUT", 300.0),
+            max_attempts=_get_server_runtime_option(self.config, "max_attempts", "SGLANG_SERVER_MAX_ATTEMPTS", 5),
+            retry_delay=_get_server_runtime_option(self.config, "retry_delay", "SGLANG_SERVER_RETRY_DELAY", 5.0),
             trust_remote_code=self.model_config.trust_remote_code,
         )
 
@@ -214,27 +282,37 @@ class ServerAdapter(BaseRollout):
         else:
             weights = weights
 
-        if _has_weight_sync:
-            async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                await sgl_update_weights(
-                    engine=self._engine,
-                    params_batch=params_batch,
-                    device_mesh_key="infer_tp",
-                    device_mesh=self.device_mesh,
-                )
-        else:
-            # Fallback for sglang < 0.5.0 (no weight_sync module)
-            # Use Ray remote call to bypass HTTP overhead (base64 + HTTP POST)
-            from sglang.srt.utils import MultiprocessingSerializer
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                    batch_list = list(params_batch)
-                    serialized = [
-                        MultiprocessingSerializer.serialize(batch_list) for _ in range(self.device_mesh["infer_tp"].size())
-                    ]
-                    await self.server_actor.update_weights_direct.remote(serialized)
+        is_tp_rank_zero = self.device_mesh["infer_tp"].get_local_rank() == 0
+        if is_tp_rank_zero:
+            await self.server_actor.abort_all_requests.remote()
 
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self._engine.flush_cache()
-            if global_steps is not None:
-                await self.server_actor.set_global_steps.remote(global_steps)
+        try:
+            if _has_weight_sync:
+                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                    await _sgl_update_weights_no_flush(
+                        engine=self._engine,
+                        params_batch=params_batch,
+                        device_mesh_key="infer_tp",
+                        device_mesh=self.device_mesh,
+                    )
+            else:
+                # Fallback for sglang < 0.5.0 (no weight_sync module)
+                # Use Ray remote call to bypass HTTP overhead (base64 + HTTP POST)
+                from sglang.srt.utils import MultiprocessingSerializer
+
+                if is_tp_rank_zero:
+                    async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                        batch_list = list(params_batch)
+                        serialized = [
+                            MultiprocessingSerializer.serialize(batch_list)
+                            for _ in range(self.device_mesh["infer_tp"].size())
+                        ]
+                        await self.server_actor.update_weights_direct.remote(serialized)
+
+            if is_tp_rank_zero:
+                await self.server_actor.clear_kv_cache.remote()
+                if global_steps is not None:
+                    await self.server_actor.set_global_steps.remote(global_steps)
+        finally:
+            if is_tp_rank_zero:
+                await self.server_actor.resume_generation.remote()

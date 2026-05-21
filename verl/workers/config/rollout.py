@@ -114,22 +114,15 @@ class MultiTurnConfig(BaseConfig):
     selection_max_turns: int = 8  # Max model-selected turns before automatic recent-turn retention. <=0 disables cap.
     echo_recent_turns: int = 3  # Always retain the latest K turns in addition to selected turns.
     sum_last_turn_instruction: str = (
-        "# Turn Summary Requirement\n"
-        "After each tool/function response, before the next tool/function call, write one concise factual summary of that latest response.\n\n"
-        "Rules:\n"
-        "- Output exactly one <sum_last_turn>...</sum_last_turn> block before the next tool/function call.\n"
-        "- Put the block outside <think>; if you use <think>, close </think> before writing <sum_last_turn>.\n"
-        "- Summarize only the latest tool/function response and the useful result it provides.\n"
-        "- Do not include <think>, tool calls, markdown fences, or long raw passages inside the tags.\n"
-        "- Keep it short: one sentence or at most 300 characters.\n"
-        "- If the tool/function response failed or was empty, state the failure briefly.\n"
-        "- After closing </sum_last_turn>, continue with the next tool/function call only if needed.\n\n"
-        "<sum_last_turn>[one concise factual sentence]</sum_last_turn>"
+        "# Tool Result Summary Protocol\n"
+        "After receiving a tool/function response, your next assistant message must include exactly one "
+        "<sum_last_turn>...</sum_last_turn> block before any new tool/function call.\n"
+        "The block should be one concise factual sentence summarizing only the latest tool/function result.\n"
+        "After the block, continue in the same assistant message with the next tool/function call, "
+        "or call finish if the final answer is ready. Do not stop after the summary."
     )
     sum_last_turn_hint: str = (
-        "Before the next tool/function call, output exactly one <sum_last_turn>...</sum_last_turn> block "
-        "outside <think>, summarizing only the latest tool/function response. Keep it one sentence or at most "
-        "300 characters; do not include <think>, raw long passages, or tool calls inside the tags."
+        "Briefly record the latest tool result in <sum_last_turn>...</sum_last_turn>, then continue with the next action."
     )
     sum_last_turn_max_chars: int = 300
 

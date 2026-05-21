@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import concurrent.futures
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 
 from verl import DataProto
@@ -91,6 +93,32 @@ def addition_process(output: DataProto):
     return output
 
 
+def _coerce_param_version(value):
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    return int(value)
+
+
+def _normalize_param_versions(param_version_start, param_version_end):
+    starts = []
+    ends = []
+    for start, end in zip(param_version_start, param_version_end, strict=False):
+        start = _coerce_param_version(start)
+        end = _coerce_param_version(end)
+        if start is None and end is None:
+            start = 0
+            end = 0
+        elif start is None:
+            start = end
+        elif end is None:
+            end = start
+        starts.append(start)
+        ends.append(end)
+    return starts, ends
+
+
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
@@ -160,6 +188,9 @@ def assemble_batch_from_rollout_samples(
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+    param_version_start, param_version_end = _normalize_param_versions(param_version_start, param_version_end)
+    final_batch.non_tensor_batch["min_global_steps"] = np.array(param_version_start, dtype=object)
+    final_batch.non_tensor_batch["max_global_steps"] = np.array(param_version_end, dtype=object)
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
@@ -168,7 +199,7 @@ def assemble_batch_from_rollout_samples(
         "fully_async/partial/max_partial_span": max(param_version_diff),
     }
     # add meta_info
-    trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
+    trajectory_param_versions = param_version_end
 
     final_batch.meta_info.update(
         {
@@ -355,6 +386,26 @@ class MetricsAggregator:
         }
 
 
+def is_task_cancelled_exception(exc: BaseException) -> bool:
+    """Return True for expected asyncio/concurrent/Ray task cancellation errors."""
+    if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError, ray.exceptions.TaskCancelledError)):
+        return True
+
+    if isinstance(exc, ray.exceptions.RayTaskError):
+        try:
+            cause = exc.as_instanceof_cause()
+        except Exception:
+            cause = None
+        if isinstance(cause, ray.exceptions.TaskCancelledError):
+            return True
+        if cause is not None and "TaskCancelledError" in type(cause).__name__:
+            return True
+        if "TaskCancelledError" in type(exc).__name__ or "TaskCancelledError" in str(exc):
+            return True
+
+    return False
+
+
 def task_exception_handler(task: asyncio.Task):
     """Handle task exceptions and log them"""
     try:
@@ -362,6 +413,8 @@ def task_exception_handler(task: asyncio.Task):
     except asyncio.CancelledError:
         pass  # Task was cancelled, this is expected
     except Exception as e:
+        if is_task_cancelled_exception(e):
+            return
         print(f"Task {task.get_name()} failed with exception: {e}")
         raise e
 

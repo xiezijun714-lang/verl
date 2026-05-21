@@ -220,6 +220,17 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
     
     # Mark padded rows as dummy trajectories.
     dummy_data.non_tensor_batch["is_dummy"] = np.ones(pad_size, dtype=bool)
+    if "is_final" in dummy_data.non_tensor_batch:
+        dummy_data.non_tensor_batch["is_final"] = np.zeros(pad_size, dtype=bool)
+    if "overlong" in dummy_data.non_tensor_batch:
+        dummy_data.non_tensor_batch["overlong"] = np.ones(pad_size, dtype=bool)
+    if "traj_idx" in dummy_data.non_tensor_batch:
+        dummy_data.non_tensor_batch["traj_idx"] = np.full(pad_size, -1, dtype=np.int64)
+    for key in ("uid", "rollout_id"):
+        if key in dummy_data.non_tensor_batch:
+            dummy_data.non_tensor_batch[key] = np.array(
+                [f"__supo_dummy_{current_size}_{idx}" for idx in range(pad_size)], dtype=object
+            )
     
     padded_data = DataProto.concat([data, dummy_data])
     return padded_data, pad_size
@@ -227,6 +238,9 @@ def pad_supo_dummy_trajectories(data: "DataProto", mini_batch_size: int) -> tupl
 
 def unpad_supo_dummy_trajectories(data: "DataProto", pad_size: int) -> "DataProto":
     """Remove dummy trajectory padding."""
+    if pad_size > 0 and "is_dummy" in data.non_tensor_batch:
+        non_dummy_indices = np.where(~data.non_tensor_batch["is_dummy"])[0]
+        return data[non_dummy_indices.tolist()]
     if pad_size > 0:
         return data[:-pad_size]
     return data
@@ -530,7 +544,15 @@ class DataProto:
     def __setstate__(self, data):
         batch_deserialized_bytes, non_tensor_batch, meta_info = data
 
-        if os.getenv("VERL_DATAPROTO_SERIALIZATION_METHOD") == "numpy":
+        is_numpy_serialized = (
+            os.getenv("VERL_DATAPROTO_SERIALIZATION_METHOD") == "numpy"
+            or (
+                batch_deserialized_bytes is not None
+                and not isinstance(batch_deserialized_bytes, bytes | bytearray | memoryview)
+            )
+        )
+
+        if is_numpy_serialized:
             if batch_deserialized_bytes is not None:
                 self.batch = deserialize_tensordict(batch_deserialized_bytes)
             else:
@@ -1074,8 +1096,10 @@ class DataProto:
                                 all_metrics.append(v)
                     else:
                         if k in merged_meta_info:
-                            # Ensure consistency for overlapping non-metric keys
-                            assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+                            if isinstance(v, list) and isinstance(merged_meta_info[k], list):
+                                merged_meta_info[k] = list(set(merged_meta_info[k]) | set(v))
+                            else:
+                                assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
                         else:
                             merged_meta_info[k] = v
 

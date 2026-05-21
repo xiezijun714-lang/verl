@@ -76,6 +76,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             log_probs=[],
             num_preempted=0,
         )
+        global_steps = None
         min_global_steps, max_global_steps = None, None
 
         while True:
@@ -103,6 +104,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
+            if global_steps is None:
+                global_steps = 0
             if min_global_steps is None:
                 min_global_steps = global_steps
             max_global_steps = global_steps

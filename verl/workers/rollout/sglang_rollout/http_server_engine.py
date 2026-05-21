@@ -387,6 +387,7 @@ class HttpServerAdapter(EngineBase):
                 "load_format": load_format,
                 "flush_cache": flush_cache,
             },
+            timeout=self.timeout,
         )
 
     def shutdown(self) -> None:
@@ -774,6 +775,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
                 "load_format": load_format,
                 "flush_cache": flush_cache,
             },
+            timeout=self.timeout,
         )
 
     async def flush_cache(self) -> dict[str, Any]:

@@ -72,6 +72,7 @@ class TrajectoryOutput:
     response_logprobs: list[float]
     response_turn_ids: list[int]
     response_finding_turn_ids: list[int]
+    response_selection_mask: list[int]
     is_final: bool = False
 
 
@@ -131,6 +132,7 @@ class AgentData:
         self.accumulated_logprobs: list[float] = []
         self.accumulated_response_turn_ids: list[int] = []
         self.accumulated_response_finding_turn_ids: list[int] = []
+        self.accumulated_response_selection_mask: list[int] = []
 
         # Turn-level history used by ECHO context reconstruction.
         self.turn_history: list[dict] = []  # [{"action": str, "finding": str, "source_traj_idx": int, "turn_id": int}]
@@ -230,24 +232,17 @@ class ToolAgentLoop(AgentLoopBase):
         self.sum_last_turn_instruction = getattr(
             self.rollout_config.multi_turn,
             'sum_last_turn_instruction',
-            "# Turn Summary Requirement\n"
-            "After each tool/function response, before the next tool/function call, write one concise factual summary of that latest response.\n\n"
-            "Rules:\n"
-            "- Output exactly one <sum_last_turn>...</sum_last_turn> block before the next tool/function call.\n"
-            "- Put the block outside <think>; if you use <think>, close </think> before writing <sum_last_turn>.\n"
-            "- Summarize only the latest tool/function response and the useful result it provides.\n"
-            "- Do not include <think>, tool calls, markdown fences, or long raw passages inside the tags.\n"
-            "- Keep it short: one sentence or at most 300 characters.\n"
-            "- If the tool/function response failed or was empty, state the failure briefly.\n"
-            "- After closing </sum_last_turn>, continue with the next tool/function call only if needed.\n\n"
-            "<sum_last_turn>[one concise factual sentence]</sum_last_turn>"
+            "# Tool Result Summary Protocol\n"
+            "After receiving a tool/function response, your next assistant message must include exactly one "
+            "<sum_last_turn>...</sum_last_turn> block before any new tool/function call.\n"
+            "The block should be one concise factual sentence summarizing only the latest tool/function result.\n"
+            "After the block, continue in the same assistant message with the next tool/function call, "
+            "or call finish if the final answer is ready. Do not stop after the summary."
         )
         self.sum_last_turn_hint = getattr(
             self.rollout_config.multi_turn,
             'sum_last_turn_hint',
-            "Before the next tool/function call, output exactly one <sum_last_turn>...</sum_last_turn> block "
-            "outside <think>, summarizing only the latest tool/function response. Keep it one sentence or at most "
-            "300 characters; do not include <think>, raw long passages, or tool calls inside the tags."
+            "Briefly record the latest tool result in <sum_last_turn>...</sum_last_turn>, then continue with the next action."
         )
 
     @rollout_trace_op
@@ -344,6 +339,7 @@ class ToolAgentLoop(AgentLoopBase):
                 truncated_logprobs = traj.response_logprobs[:self.response_length] if traj.response_logprobs else None
                 truncated_response_turn_ids = traj.response_turn_ids[:self.response_length]
                 truncated_response_finding_turn_ids = traj.response_finding_turn_ids[:self.response_length]
+                truncated_response_selection_mask = traj.response_selection_mask[:self.response_length]
                 
                 output = AgentLoopOutput(
                     prompt_ids=truncated_prompt_ids,
@@ -355,6 +351,7 @@ class ToolAgentLoop(AgentLoopBase):
                     metrics=agent_data.metrics,
                     routed_experts=agent_data.routed_experts if i == len(agent_data.trajectory_outputs) - 1 else None,
                     extra_fields={
+                        **agent_data.extra_fields,
                         "traj_idx": i,
                         "is_final": traj.is_final,
                         "overlong": agent_data.overlong,
@@ -369,6 +366,7 @@ class ToolAgentLoop(AgentLoopBase):
                         "echo_selected_turn_ids": final_selected_turn_ids if traj.is_final else None,
                         "echo_response_turn_ids": truncated_response_turn_ids,
                         "echo_response_finding_turn_ids": truncated_response_finding_turn_ids,
+                        "echo_response_selection_mask": truncated_response_selection_mask,
                     },
                 )
                 outputs.append(output)
@@ -406,6 +404,28 @@ class ToolAgentLoop(AgentLoopBase):
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
+
+    def _merge_generation_extra_fields(self, agent_data: AgentData, extra_fields: dict[str, Any]):
+        """Propagate rollout-server metadata across multi-turn and compressed trajectories."""
+        if not extra_fields:
+            return
+
+        for key, value in extra_fields.items():
+            if key not in {"global_steps", "min_global_steps", "max_global_steps"}:
+                agent_data.extra_fields[key] = value
+
+        version_start = extra_fields.get("min_global_steps", extra_fields.get("global_steps"))
+        version_end = extra_fields.get("max_global_steps", extra_fields.get("global_steps"))
+
+        if version_start is not None:
+            previous_start = agent_data.extra_fields.get("min_global_steps")
+            agent_data.extra_fields["min_global_steps"] = (
+                version_start if previous_start is None else min(previous_start, version_start)
+            )
+
+        if version_end is not None:
+            agent_data.extra_fields["global_steps"] = version_end
+            agent_data.extra_fields["max_global_steps"] = version_end
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
@@ -453,6 +473,8 @@ class ToolAgentLoop(AgentLoopBase):
                 video_data=agent_data.video_data,
             )
 
+        self._merge_generation_extra_fields(agent_data, output.extra_fields)
+
         # Compression generations are auxiliary and do not count as assistant turns.
         if not (self.enable_summarization and agent_data.is_summarizing):
             agent_data.assistant_turns += 1
@@ -479,6 +501,7 @@ class ToolAgentLoop(AgentLoopBase):
             selected_indices: list = []
             pending = None
             if self.context_compression_method == "echo_e2e":
+                self._mark_last_trajectory_selection_tokens(agent_data, full_output)
                 pending = getattr(agent_data, 'pending_turn', None)
                 if pending:
                     finding = self._extract_turn_finding(full_output)
@@ -554,6 +577,7 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.accumulated_logprobs = []
             agent_data.accumulated_response_turn_ids = []
             agent_data.accumulated_response_finding_turn_ids = []
+            agent_data.accumulated_response_selection_mask = []
             
             agent_data.is_summarizing = False
             agent_data.summary_count += 1
@@ -593,6 +617,7 @@ class ToolAgentLoop(AgentLoopBase):
                     )
             agent_data.accumulated_response_turn_ids.extend(response_turn_ids)
             agent_data.accumulated_response_finding_turn_ids.extend(response_finding_turn_ids)
+            agent_data.accumulated_response_selection_mask.extend([0] * len(agent_data.response_ids))
 
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
@@ -636,6 +661,9 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.accumulated_response_turn_ids = agent_data.accumulated_response_turn_ids[:-a_t_len]
                     agent_data.accumulated_response_finding_turn_ids = (
                         agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
+                    )
+                    agent_data.accumulated_response_selection_mask = (
+                        agent_data.accumulated_response_selection_mask[:-a_t_len]
                     )
                 if self.context_compression_method == "echo_e2e":
                     self._save_current_trajectory_without_current_turn(agent_data)
@@ -842,6 +870,9 @@ class ToolAgentLoop(AgentLoopBase):
                             agent_data.accumulated_response_finding_turn_ids = (
                                 agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
                             )
+                            agent_data.accumulated_response_selection_mask = (
+                                agent_data.accumulated_response_selection_mask[:-a_t_len]
+                            )
                         agent_data.pending_turn = None
                         self._save_current_trajectory_without_current_turn(agent_data)
                         if not self._has_echo_selection_history(agent_data):
@@ -874,6 +905,9 @@ class ToolAgentLoop(AgentLoopBase):
                             agent_data.accumulated_response_turn_ids = agent_data.accumulated_response_turn_ids[:-a_t_len]
                             agent_data.accumulated_response_finding_turn_ids = (
                                 agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
+                            )
+                            agent_data.accumulated_response_selection_mask = (
+                                agent_data.accumulated_response_selection_mask[:-a_t_len]
                             )
                         agent_data.pending_turn = None
                         self._save_current_trajectory_without_current_turn(agent_data)
@@ -913,6 +947,9 @@ class ToolAgentLoop(AgentLoopBase):
                             agent_data.accumulated_response_finding_turn_ids = (
                                 agent_data.accumulated_response_finding_turn_ids[:-a_t_len]
                             )
+                            agent_data.accumulated_response_selection_mask = (
+                                agent_data.accumulated_response_selection_mask[:-a_t_len]
+                            )
                         return await self._trigger_summary(agent_data)
                 else:
                     agent_data.overlong = True
@@ -945,6 +982,7 @@ class ToolAgentLoop(AgentLoopBase):
             tool_turn_id = agent_data.pending_turn["turn_id"] if echo_inject_hint and hasattr(agent_data, "pending_turn") else -1
             agent_data.accumulated_response_turn_ids.extend([tool_turn_id] * len(tool_response_ids))
             agent_data.accumulated_response_finding_turn_ids.extend([-1] * len(tool_response_ids))
+            agent_data.accumulated_response_selection_mask.extend([0] * len(tool_response_ids))
 
         agent_data.prompt_ids += tool_response_ids
         agent_data.response_mask += [0] * len(tool_response_ids)
@@ -1493,6 +1531,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.accumulated_logprobs = []
         agent_data.accumulated_response_turn_ids = []
         agent_data.accumulated_response_finding_turn_ids = []
+        agent_data.accumulated_response_selection_mask = []
         agent_data.is_summarizing = False
         agent_data.summary_count += 1
         logger.debug(
@@ -1561,6 +1600,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.accumulated_logprobs = []
         agent_data.accumulated_response_turn_ids = []
         agent_data.accumulated_response_finding_turn_ids = []
+        agent_data.accumulated_response_selection_mask = []
         agent_data.is_summarizing = False
         agent_data.summary_count += 1
         agent_data.turn_history = [
@@ -1580,7 +1620,9 @@ class ToolAgentLoop(AgentLoopBase):
         """Trigger summary-based context compression."""
         summary_messages = [{"role": "user", "content": self.summary_instruction}]
         summary_instruction_ids = await self.apply_chat_template(
-            summary_messages, remove_system_prompt=True,
+            summary_messages,
+            remove_system_prompt=True,
+            **self._compression_chat_template_overrides(),
         )
         agent_data.sum_instruction_ids = summary_instruction_ids
         agent_data.prompt_ids = (
@@ -1624,7 +1666,9 @@ class ToolAgentLoop(AgentLoopBase):
         # Keep the selection instruction separate from the task prompt.
         selection_messages = [{"role": "user", "content": instruction}]
         selection_instruction_ids = await self.apply_chat_template(
-            selection_messages, remove_system_prompt=True,
+            selection_messages,
+            remove_system_prompt=True,
+            **self._compression_chat_template_overrides(),
         )
 
         agent_data.prompt_ids = (
@@ -1638,6 +1682,12 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.is_summarizing = True
         
         return AgentState.GENERATING
+
+    def _compression_chat_template_overrides(self) -> dict[str, bool]:
+        """Disable thinking only for auxiliary compression prompts when supported."""
+        if "enable_thinking" in self.apply_chat_template_kwargs:
+            return {"enable_thinking": False}
+        return {}
 
     # SUPO/ECHO support
     def _build_summary_span_mask(self, text: str, response_ids: list[int]) -> list[bool]:
@@ -1669,6 +1719,37 @@ class ToolAgentLoop(AgentLoopBase):
         for idx in range(start, end):
             summary_span_mask[idx] = True
         return summary_span_mask
+
+    def _build_selection_span_mask(self, text: str, response_ids: list[int]) -> list[bool]:
+        """Identify generated <selection> tokens in an ECHO compression response."""
+        selection_span_mask = [False] * len(response_ids)
+        if not response_ids:
+            return selection_span_mask
+
+        match = re.search(r"<selection>.*?</selection>", text, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            span_start = match.start()
+            span_end = match.end()
+        else:
+            open_match = re.search(r"<selection>(.*)", text, flags=re.DOTALL | re.IGNORECASE)
+            if not open_match:
+                return selection_span_mask
+            span_start = open_match.start()
+            marker_match = re.search(TOOL_CALL_MARKER_PATTERN, open_match.group(1), flags=re.IGNORECASE | re.DOTALL)
+            if marker_match:
+                span_end = open_match.start(1) + marker_match.start()
+            else:
+                span_end = len(text)
+        if span_end <= span_start:
+            return selection_span_mask
+
+        prefix_ids = self.tokenizer.encode(text[:span_start], add_special_tokens=False)
+        span_ids = self.tokenizer.encode(text[span_start:span_end], add_special_tokens=False)
+        start = min(len(prefix_ids), len(response_ids))
+        end = min(start + len(span_ids), len(response_ids))
+        for idx in range(start, end):
+            selection_span_mask[idx] = True
+        return selection_span_mask
 
     def _build_finding_turn_ids(self, text: str, response_ids: list[int], turn_id: int | None) -> list[int]:
         """Map the generated <sum_last_turn> span to the contributing ECHO turn."""
@@ -1726,6 +1807,27 @@ class ToolAgentLoop(AgentLoopBase):
             if 0 <= target_idx < len(last_traj.response_finding_turn_ids):
                 last_traj.response_finding_turn_ids[target_idx] = turn_idx
 
+    def _mark_last_trajectory_selection_tokens(self, agent_data: AgentData, text: str):
+        """Mark selection tokens appended by an ECHO compression generation."""
+        if not agent_data.trajectory_outputs:
+            return
+
+        selection_span_mask = self._build_selection_span_mask(text, agent_data.response_ids)
+        if not any(selection_span_mask):
+            return
+
+        last_traj = agent_data.trajectory_outputs[-1]
+        start = len(last_traj.response_selection_mask) - len(agent_data.response_ids)
+        if start < 0:
+            return
+
+        for offset, is_selection_token in enumerate(selection_span_mask):
+            if not is_selection_token:
+                continue
+            target_idx = start + offset
+            if 0 <= target_idx < len(last_traj.response_selection_mask):
+                last_traj.response_selection_mask[target_idx] = 1
+
     def _save_current_trajectory_without_current_turn(self, agent_data: AgentData):
         """Save the current trajectory segment after the truncated turn is removed."""
         resp = agent_data.accumulated_response_ids
@@ -1733,8 +1835,9 @@ class ToolAgentLoop(AgentLoopBase):
         logp = agent_data.accumulated_logprobs
         turn_ids = agent_data.accumulated_response_turn_ids
         finding_turn_ids = agent_data.accumulated_response_finding_turn_ids
+        selection_mask = agent_data.accumulated_response_selection_mask
         
-        min_len = min(len(resp), len(mask), len(logp), len(turn_ids), len(finding_turn_ids))
+        min_len = min(len(resp), len(mask), len(logp), len(turn_ids), len(finding_turn_ids), len(selection_mask))
         if min_len == 0:
             return
         
@@ -1745,6 +1848,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=list(logp[:min_len]),
             response_turn_ids=list(turn_ids[:min_len]),
             response_finding_turn_ids=list(finding_turn_ids[:min_len]),
+            response_selection_mask=list(selection_mask[:min_len]),
             is_final=False,
         ))
         
@@ -1767,6 +1871,7 @@ class ToolAgentLoop(AgentLoopBase):
         logp = list(agent_data.accumulated_logprobs)
         turn_ids = list(agent_data.accumulated_response_turn_ids)
         finding_turn_ids = list(agent_data.accumulated_response_finding_turn_ids)
+        selection_mask = list(agent_data.accumulated_response_selection_mask)
 
         if extra_response_ids:
             extra_len = len(extra_response_ids)
@@ -1775,8 +1880,9 @@ class ToolAgentLoop(AgentLoopBase):
             logp.extend([0.0] * extra_len)
             turn_ids.extend([extra_response_turn_id] * extra_len)
             finding_turn_ids.extend([-1] * extra_len)
+            selection_mask.extend([0] * extra_len)
 
-        min_len = min(len(resp), len(mask), len(logp), len(turn_ids), len(finding_turn_ids))
+        min_len = min(len(resp), len(mask), len(logp), len(turn_ids), len(finding_turn_ids), len(selection_mask))
         if min_len == 0:
             return
 
@@ -1787,6 +1893,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=list(logp[:min_len]),
             response_turn_ids=list(turn_ids[:min_len]),
             response_finding_turn_ids=list(finding_turn_ids[:min_len]),
+            response_selection_mask=list(selection_mask[:min_len]),
             is_final=False,
         ))
 
@@ -1805,12 +1912,14 @@ class ToolAgentLoop(AgentLoopBase):
             last_traj.response_logprobs.extend([0.0] * len(agent_data.sum_instruction_ids))
             last_traj.response_turn_ids.extend([-1] * len(agent_data.sum_instruction_ids))
             last_traj.response_finding_turn_ids.extend([-1] * len(agent_data.sum_instruction_ids))
+            last_traj.response_selection_mask.extend([0] * len(agent_data.sum_instruction_ids))
 
         last_traj.response_ids.extend(agent_data.response_ids)
         last_traj.response_mask.extend([1] * len(agent_data.response_ids))
         last_traj.response_turn_ids.extend([-1] * len(agent_data.response_ids))
         last_traj.response_finding_turn_ids.extend([-1] * len(agent_data.response_ids))
         resp_len = len(agent_data.response_ids)
+        last_traj.response_selection_mask.extend([0] * resp_len)
         if summary_logprobs:
             last_traj.response_logprobs.extend(summary_logprobs[:resp_len])
         else:
@@ -1824,6 +1933,7 @@ class ToolAgentLoop(AgentLoopBase):
             len(agent_data.accumulated_logprobs),
             len(agent_data.accumulated_response_turn_ids),
             len(agent_data.accumulated_response_finding_turn_ids),
+            len(agent_data.accumulated_response_selection_mask),
         )
         agent_data.trajectory_outputs.append(TrajectoryOutput(
             prompt_ids=list(agent_data.current_traj_prompt_ids),
@@ -1832,6 +1942,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=list(agent_data.accumulated_logprobs[:min_len]),
             response_turn_ids=list(agent_data.accumulated_response_turn_ids[:min_len]),
             response_finding_turn_ids=list(agent_data.accumulated_response_finding_turn_ids[:min_len]),
+            response_selection_mask=list(agent_data.accumulated_response_selection_mask[:min_len]),
             is_final=True,
         ))
         

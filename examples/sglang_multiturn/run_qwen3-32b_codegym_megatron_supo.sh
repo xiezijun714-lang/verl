@@ -57,10 +57,9 @@ CODEGYM_ENVS_OUT_DIR="${CODEGYM_REPO}/online_server/online_server/envs/codegym_v
 CODEGYM_SERVER_HOST="http://${HEAD_IP}:8000"
 CODEGYM_WORKERS=${CODEGYM_WORKERS:-1024}
 
-TRAIN_FILES_RAW="['${CODEGYM_TASK_DIR}/train-00000-of-00004.parquet','${CODEGYM_TASK_DIR}/train-00001-of-00004.parquet','${CODEGYM_TASK_DIR}/train-00002-of-00004.parquet']"
 FILTERED_DATA_DIR="${PROJECT_DIR}/data/codegym_filtered_grpo"
 TRAIN_SAMPLED="${FILTERED_DATA_DIR}/train_12800.parquet"
-TRAIN_FILES="${TRAIN_SAMPLED}"
+TRAIN_FILES="${TRAIN_FILES:-${TRAIN_SAMPLED}}"
 VAL_DIR="${CODEGYM_DATA_ROOT}/val"
 VAL_QWEN3_FILTERED_FILE="${VAL_DIR}/val_128_qwen3_pass25.parquet"
 VAL_FILES="${VAL_FILES:-${VAL_QWEN3_FILTERED_FILE}}"
@@ -73,7 +72,6 @@ if [ "$CODEGYM_WORKERS" -lt "$MIN_CODEGYM_WORKERS" ]; then
     echo "[codegym] Raising CODEGYM_WORKERS from ${CODEGYM_WORKERS} to ${MIN_CODEGYM_WORKERS} to match train_batch_size * n_resp."
     CODEGYM_WORKERS="$MIN_CODEGYM_WORKERS"
 fi
-TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-12800}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-128}
 VAL_KWARGS_N=${VAL_KWARGS_N:-1}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-False}
@@ -85,12 +83,12 @@ VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-${PROJECT_DIR}/val_outputs_codegym_s
 
 # ---- Parallelism ----
 ACTOR_TP=${ACTOR_TP:-8}
-ACTOR_PP=${ACTOR_PP:-4}
+ACTOR_PP=${ACTOR_PP:-2}
 ACTOR_VPP=null
 ACTOR_CP=${ACTOR_CP:-1}
 
 REF_TP=${REF_TP:-8}
-REF_PP=${REF_PP:-4}
+REF_PP=${REF_PP:-2}
 REF_VPP=null
 REF_CP=${REF_CP:-1}
 
@@ -104,12 +102,14 @@ MAX_TOOL_RESPONSE_LENGTH=${MAX_TOOL_RESPONSE_LENGTH:-2048}
 # ---- SUPO Configuration ----
 # CodeGym paper config: 4K working context, S=7, max 8 trajectory segments.
 WORKING_CONTEXT_LENGTH=${WORKING_CONTEXT_LENGTH:-4096}
+ECHO_CREDIT_METHOD=${ECHO_CREDIT_METHOD:-none}
+ECHO_CREDIT_PENALTY_RATIO=${ECHO_CREDIT_PENALTY_RATIO:-1.0}
 MAX_SUMMARY_ROUNDS=${MAX_SUMMARY_ROUNDS:-7}
 SUMMARY_MAX_CHARS=${SUMMARY_MAX_CHARS:-1536}
 CODEGYM_SUMMARY_INSTRUCTION=${CODEGYM_SUMMARY_INSTRUCTION:-"System: You are a helpful agent interacting with a function calling environment to solve the problem. The interaction history is now too long. Please summarize the interaction history. Remember to keep the important information in the history to ensure that you can continue solving the problem. Do not call any function in this turn. Now generate the summary, and put your summary inside tag <summary></summary>."}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 CONTEXT_COMPRESSION_METHOD=${CONTEXT_COMPRESSION_METHOD:-summary}
-ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.2}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.35}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-64}
 SGLANG_CHUNKED_PREFILL_SIZE=${SGLANG_CHUNKED_PREFILL_SIZE:-4096}
 SGLANG_MAX_PREFILL_TOKENS=${SGLANG_MAX_PREFILL_TOKENS:-8192}
@@ -121,14 +121,16 @@ REF_TOKEN_BUDGET_PER_GPU=$(((TOKEN_BUDGET + REF_CP - 1) / REF_CP))
 TOTAL_GPUS=$((NNODES * 8))
 ACTOR_MODEL_PARALLEL_SIZE=$((ACTOR_TP * ACTOR_PP * ACTOR_CP))
 REF_MODEL_PARALLEL_SIZE=$((REF_TP * REF_PP * REF_CP))
-if [ "$ACTOR_MODEL_PARALLEL_SIZE" -ne "$TOTAL_GPUS" ]; then
-    echo "[config] ERROR: ACTOR_TP*ACTOR_PP*ACTOR_CP=${ACTOR_MODEL_PARALLEL_SIZE}, expected ${TOTAL_GPUS}."
+if [ "$ACTOR_MODEL_PARALLEL_SIZE" -gt "$TOTAL_GPUS" ] || [ $((TOTAL_GPUS % ACTOR_MODEL_PARALLEL_SIZE)) -ne 0 ]; then
+    echo "[config] ERROR: ACTOR_TP*ACTOR_PP*ACTOR_CP=${ACTOR_MODEL_PARALLEL_SIZE} must divide total GPUs=${TOTAL_GPUS}."
     exit 1
 fi
-if [ "$REF_MODEL_PARALLEL_SIZE" -ne "$TOTAL_GPUS" ]; then
-    echo "[config] ERROR: REF_TP*REF_PP*REF_CP=${REF_MODEL_PARALLEL_SIZE}, expected ${TOTAL_GPUS}."
+if [ "$REF_MODEL_PARALLEL_SIZE" -gt "$TOTAL_GPUS" ] || [ $((TOTAL_GPUS % REF_MODEL_PARALLEL_SIZE)) -ne 0 ]; then
+    echo "[config] ERROR: REF_TP*REF_PP*REF_CP=${REF_MODEL_PARALLEL_SIZE} must divide total GPUs=${TOTAL_GPUS}."
     exit 1
 fi
+ACTOR_DP=$((TOTAL_GPUS / ACTOR_MODEL_PARALLEL_SIZE))
+REF_DP=$((TOTAL_GPUS / REF_MODEL_PARALLEL_SIZE))
 if [ "$TOKEN_BUDGET" -ge "$MAX_MODEL_LEN" ]; then
     echo "[config] ERROR: MAX_PROMPT_LENGTH+MAX_RESPONSE_LENGTH=${TOKEN_BUDGET} must be < MAX_MODEL_LEN=${MAX_MODEL_LEN}."
     exit 1
@@ -140,7 +142,8 @@ fi
 
 echo "[config] CodeGym SUPO context: prompt=${MAX_PROMPT_LENGTH}, response=${MAX_RESPONSE_LENGTH}, working=${WORKING_CONTEXT_LENGTH}, max_model=${MAX_MODEL_LEN}"
 echo "[config] compression: method=${CONTEXT_COMPRESSION_METHOD}, max_rounds=${MAX_SUMMARY_ROUNDS}, summary_max_chars=${SUMMARY_MAX_CHARS}, max_segments=$((MAX_SUMMARY_ROUNDS + 1)), effective_context=$((WORKING_CONTEXT_LENGTH * (MAX_SUMMARY_ROUNDS + 1)))"
-echo "[config] parallel: actor TP/PP/CP=${ACTOR_TP}/${ACTOR_PP}/${ACTOR_CP}, ref TP/PP/CP=${REF_TP}/${REF_PP}/${REF_CP}, rollout TP=${ROLLOUT_TP}"
+echo "[config] echo credit: method=${ECHO_CREDIT_METHOD}, penalty_ratio=${ECHO_CREDIT_PENALTY_RATIO}"
+echo "[config] parallel: actor TP/PP/CP/DP=${ACTOR_TP}/${ACTOR_PP}/${ACTOR_CP}/${ACTOR_DP}, ref TP/PP/CP/DP=${REF_TP}/${REF_PP}/${REF_CP}/${REF_DP}, rollout TP=${ROLLOUT_TP}"
 
 # ---- Sync run script and critical Python files to worker nodes ----
 echo "[sync] Syncing run script and CodeGym integration files to worker nodes ..."
@@ -152,9 +155,13 @@ SYNC_FILES=(
     "${PROJECT_DIR}/verl/experimental/agent_loop/tool_agent_loop.py"
     "${PROJECT_DIR}/verl/experimental/agent_loop/tool_parser.py"
     "${PROJECT_DIR}/verl/experimental/agent_loop/__init__.py"
+    "${PROJECT_DIR}/verl/protocol.py"
     "${PROJECT_DIR}/verl/trainer/ppo/ray_trainer.py"
     "${PROJECT_DIR}/verl/trainer/ppo/core_algos.py"
     "${PROJECT_DIR}/verl/trainer/ppo/metric_utils.py"
+    "${PROJECT_DIR}/verl/utils/metric/utils.py"
+    "${PROJECT_DIR}/verl/workers/actor/megatron_actor.py"
+    "${PROJECT_DIR}/verl/workers/critic/megatron_critic.py"
     "${PROJECT_DIR}/verl/workers/config/rollout.py"
 )
 for ip in $WORKER_IPS; do
@@ -225,14 +232,14 @@ if ! "${CODEGYM_VENV_PATH}/bin/python3" -c "import fastapi, uvicorn, gymnasium" 
     "${CODEGYM_VENV_PATH}/bin/pip" install gymnasium
 fi
 
-if [ ! -f "$TRAIN_SAMPLED" ]; then
-    echo "[codegym] ERROR: expected training file not found: $TRAIN_SAMPLED"
+if [ ! -f "$TRAIN_FILES" ]; then
+    echo "[codegym] ERROR: expected training file not found: $TRAIN_FILES"
     echo "[codegym] Run the GRPO/data-prep path first, or set TRAIN_FILES to an existing parquet."
     exit 1
 fi
 
-if [ ! -f "$VAL_QWEN3_FILTERED_FILE" ]; then
-    echo "[codegym] ERROR: expected validation file not found: $VAL_QWEN3_FILTERED_FILE"
+if [ ! -f "$VAL_FILES" ]; then
+    echo "[codegym] ERROR: expected validation file not found: $VAL_FILES"
     exit 1
 fi
 
@@ -277,7 +284,7 @@ def parse_files(value: str):
         return list(parsed)
     return [str(parsed)]
 
-task_files = parse_files("""${TRAIN_FILES_RAW}""") + parse_files("""${VAL_FILES}""")
+task_files = parse_files("""${TRAIN_FILES}""") + parse_files("""${VAL_FILES}""")
 exported = set()
 missing = set()
 exact = 0
@@ -379,6 +386,8 @@ python3 -m verl.trainer.main_ppo \
     --config-path="$PROJECT_DIR/examples/sglang_multiturn/config" \
     --config-name='codegym_multiturn_megatron_grpo' \
     algorithm.adv_estimator=supo \
+    +algorithm.echo_credit_method=${ECHO_CREDIT_METHOD} \
+    +algorithm.echo_credit_penalty_ratio=${ECHO_CREDIT_PENALTY_RATIO} \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \

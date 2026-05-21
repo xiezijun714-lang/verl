@@ -99,6 +99,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        adv_estimator = self.config.algorithm.adv_estimator
+        self._is_supo = adv_estimator == "supo" or (
+            hasattr(adv_estimator, "value") and adv_estimator.value == "supo"
+        )
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # ==================== SeparateRayPPOTrainer config ====================
@@ -506,9 +510,36 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.current_param_version += 1
             self.local_trigger_step = 1
 
+    def _fit_update_actor(self, batch: DataProto) -> DataProto:
+        if not self._is_supo or self.config.trainer.critic_warmup > self.global_steps:
+            return super()._fit_update_actor(batch)
+
+        from verl.protocol import pad_supo_dummy_trajectories, unpad_supo_dummy_trajectories
+
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+        batch, supo_pad_size = pad_supo_dummy_trajectories(batch, ppo_mini_batch_size)
+        if supo_pad_size > 0:
+            self.metrics["train/supo/dummy_pad_size"] = supo_pad_size
+
+        batch = super()._fit_update_actor(batch)
+
+        if supo_pad_size > 0:
+            batch = unpad_supo_dummy_trajectories(batch, supo_pad_size)
+        return batch
+
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
             return
+
+        # NCCL/SGLang weight update aborts active requests. Drain rollout first so
+        # param sync does not turn in-flight generations into partial samples.
+        drain_timing_raw = await self.rollouter.pause_and_drain.remote()
+        if drain_timing_raw:
+            self.logger.log(
+                data=drain_timing_raw,
+                step=self.current_param_version,
+            )
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
@@ -519,7 +550,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         # Reset staleness in rollouter
-        timing_raw = ray.get(self.rollouter.reset_staleness.remote())
+        timing_raw = await self.rollouter.reset_staleness.remote()
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,

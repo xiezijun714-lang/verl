@@ -33,6 +33,7 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
+from verl.utils.metric.utils import normalize_metric_value
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -326,7 +327,7 @@ class MegatronPPOCritic(BasePPOCritic):
             metric_micro_batch = metric_micro_batch["output"]
             update_successful, grad_norm, num_zeros_in_grad = self.critic_optimizer.step()
             learning_rate = self.critic_optimizer.param_groups[-1]["lr"]
-            data = {"critic/grad_norm": grad_norm, "critic/lr": learning_rate}
+            data = {"critic/grad_norm": normalize_metric_value(grad_norm), "critic/lr": learning_rate}
             append_to_dict(metrics, data)
 
             if update_successful:

@@ -230,6 +230,8 @@ def compute_advantage(
                 adv_kwargs["echo_response_turn_ids"] = data.non_tensor_batch["echo_response_turn_ids"]
             if "echo_response_finding_turn_ids" in data.non_tensor_batch:
                 adv_kwargs["echo_response_finding_turn_ids"] = data.non_tensor_batch["echo_response_finding_turn_ids"]
+            if "echo_response_selection_mask" in data.non_tensor_batch:
+                adv_kwargs["echo_response_selection_mask"] = data.non_tensor_batch["echo_response_selection_mask"]
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
 
         # calculate advantage estimator
@@ -563,6 +565,67 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _stringify_raw_prompt(self, raw_prompt) -> str:
+        """Render a raw chat prompt for logging when tokenized prompts are not available yet."""
+        if raw_prompt is None:
+            return ""
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if not isinstance(raw_prompt, list):
+            return str(raw_prompt)
+
+        parts = []
+        for message in raw_prompt:
+            if not isinstance(message, dict):
+                parts.append(str(message))
+                continue
+
+            role = message.get("role", "")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        content_parts.append(str(item.get("text") or item.get("content") or item))
+                    else:
+                        content_parts.append(str(item))
+                content = " ".join(content_parts)
+            parts.append(f"{role}: {content}" if role else str(content))
+        return "\n".join(parts)
+
+    def _decode_batch_prompts_for_logging(self, batch: DataProto) -> list[str]:
+        """Decode prompt text before or after rollout."""
+        if batch.batch is not None and "prompts" in batch.batch.keys():
+            return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["prompts"]]
+
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+        if raw_prompts is not None:
+            texts = []
+            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+            apply_kwargs.pop("tokenize", None)
+            apply_kwargs.pop("return_dict", None)
+            apply_kwargs.pop("return_tensors", None)
+            for raw_prompt in raw_prompts:
+                if isinstance(raw_prompt, np.ndarray):
+                    raw_prompt = raw_prompt.tolist()
+                try:
+                    texts.append(
+                        self.tokenizer.apply_chat_template(
+                            raw_prompt,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **apply_kwargs,
+                        )
+                    )
+                except Exception:
+                    texts.append(self._stringify_raw_prompt(raw_prompt))
+            return texts
+
+        if batch.batch is not None and "input_ids" in batch.batch.keys():
+            return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["input_ids"]]
+
+        return [""] * len(batch)
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "ability", "code_id"}) & batch.non_tensor_batch.keys()
 
@@ -608,6 +671,9 @@ class RayPPOTrainer:
 
         # Collect trajectory split statistics.
         supo_rollout_traj_counts = {}  # rollout_id -> max traj_idx + 1
+        supo_expected_uid_counts = defaultdict(int)
+        supo_expected_uid_data_source = {}
+        supo_final_uid_counts = defaultdict(int)
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -639,6 +705,16 @@ class RayPPOTrainer:
                         "input": expected_input_texts[i],
                         "gts": item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None),
                     })
+
+            if self._is_supo:
+                expected_uids = test_batch.non_tensor_batch["uid"]
+                expected_data_sources = test_batch.non_tensor_batch.get(
+                    "data_source", np.array(["unknown"] * len(test_batch), dtype=object)
+                )
+                for uid, data_source in zip(expected_uids, expected_data_sources, strict=False):
+                    uid_key = str(uid)
+                    supo_expected_uid_counts[uid_key] += 1
+                    supo_expected_uid_data_source[uid_key] = data_source
 
             # Non-compressed rollouts collect ground truths here; compressed rollouts collect them after union.
             if not self._is_supo:
@@ -751,7 +827,11 @@ class RayPPOTrainer:
             ])
             scores_final = [scores_all[i] for i in final_indices]
             sample_scores.extend(scores_final)
-            sample_uids.extend([test_batch.non_tensor_batch["uid"][i] for i in final_indices])
+            final_uids = [test_batch.non_tensor_batch["uid"][i] for i in final_indices]
+            sample_uids.extend(final_uids)
+            if self._is_supo:
+                for uid in final_uids:
+                    supo_final_uid_counts[str(uid)] += 1
 
             # Collect reward_extra_info for metrics
             reward_extra_infos_dict["reward"].extend(scores_final)
@@ -821,7 +901,46 @@ class RayPPOTrainer:
                         supo_rollout_traj_counts[rid] = 0
                     supo_rollout_traj_counts[rid] = max(supo_rollout_traj_counts[rid], tidx + 1)
 
+        supo_missing_final_count = 0
+        supo_missing_final_uid_count = 0
+        missing_uids = []
+        missing_data_sources = []
+        if self._is_supo and supo_expected_uid_counts:
+            for uid, expected_count in supo_expected_uid_counts.items():
+                missing_count = expected_count - supo_final_uid_counts.get(uid, 0)
+                if missing_count <= 0:
+                    continue
+                supo_missing_final_count += missing_count
+                supo_missing_final_uid_count += 1
+                missing_uids.extend([uid] * missing_count)
+                missing_data_sources.extend([supo_expected_uid_data_source.get(uid, "unknown")] * missing_count)
+
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # SUPO validation metrics should use the expected uid denominator.
+        # Overlong-only rollouts have no final segment, so final-only collection
+        # above would otherwise drop them from acc/reward metrics.
+        if self._is_supo and missing_uids:
+            sample_scores.extend([0.0] * len(missing_uids))
+            sample_uids.extend(missing_uids)
+            data_source_lst.append(np.array(missing_data_sources, dtype=object))
+
+            def _missing_metric_default(key: str):
+                if key in ("reward", "score", "acc"):
+                    return 0.0
+                if key == "is_final":
+                    return False
+                if key == "overlong":
+                    return True
+                existing = reward_extra_infos_dict.get(key, [])
+                if existing and isinstance(existing[0], str):
+                    return ""
+                if existing and isinstance(existing[0], bool):
+                    return False
+                return 0.0
+
+            for key in list(reward_extra_infos_dict.keys()):
+                reward_extra_infos_dict[key].extend([_missing_metric_default(key)] * len(missing_uids))
         
         # Compute and log trajectory split statistics.
         supo_stats = {}
@@ -837,6 +956,8 @@ class RayPPOTrainer:
                 "supo_split_ratio": split_ratio,
                 "supo_max_splits": max_splits,
                 "supo_avg_splits": avg_splits,
+                "supo_missing_final_count": supo_missing_final_count,
+                "supo_missing_final_uid_count": supo_missing_final_uid_count,
             }
 
         # dump generations (ALL trajectories for SUPO, final for non-SUPO)
@@ -1290,6 +1411,14 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
+    def _pad_supo_to_worker_dp(self, batch: DataProto, worker_group, role: str) -> tuple[DataProto, int]:
+        if not self._is_supo:
+            return batch, 0
+        dp_size = self._get_dp_size(worker_group, role)
+        if dp_size <= 1:
+            return batch, 0
+        return pad_supo_dummy_trajectories(batch, dp_size)
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
@@ -1377,22 +1506,10 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
-    def _get_worker_group_dp_size(self, worker_group, mesh_name: str) -> int:
-        if mesh_name not in worker_group._dispatch_info:
-            worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
-        return max(worker_group._dispatch_info[mesh_name]) + 1
-
-    def _pad_supo_to_worker_dp(self, batch: DataProto, worker_group, mesh_name: str) -> tuple[DataProto, int]:
-        if not self._is_supo:
-            return batch, 0
-        dp_size = self._get_worker_group_dp_size(worker_group, mesh_name)
-        if dp_size <= 1:
-            return batch, 0
-        return pad_dataproto_to_divisor(batch, dp_size)
-
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         ref_worker_group = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
-        batch, supo_pad_size = self._pad_supo_to_worker_dp(batch, ref_worker_group, "actor")
+        ref_role = "actor" if self.ref_in_actor else str(Role.RefPolicy)
+        batch, supo_pad_size = self._pad_supo_to_worker_dp(batch, ref_worker_group, ref_role)
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1417,7 +1534,8 @@ class RayPPOTrainer:
         else:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
-        ref_log_prob = unpad_dataproto(ref_log_prob, supo_pad_size)
+        if supo_pad_size > 0:
+            ref_log_prob = unpad_dataproto(ref_log_prob, supo_pad_size)
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
@@ -1448,7 +1566,8 @@ class RayPPOTrainer:
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
-        old_log_prob = unpad_dataproto(old_log_prob, supo_pad_size)
+        if supo_pad_size > 0:
+            old_log_prob = unpad_dataproto(old_log_prob, supo_pad_size)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1670,6 +1789,12 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    supo_balance_pad_size = 0
+                    if self._is_supo:
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        batch, supo_balance_pad_size = pad_supo_dummy_trajectories(batch, dp_size)
+                        if supo_balance_pad_size > 0:
+                            metrics["train/supo/dp_dummy_pad_size"] = supo_balance_pad_size
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1818,9 +1943,9 @@ class RayPPOTrainer:
                         if self._is_supo:
                             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
                             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-                            actor_dp_size = self._get_worker_group_dp_size(self.actor_rollout_wg, "actor")
-                            supo_pad_divisor = math.lcm(ppo_mini_batch_size, actor_dp_size)
-                            batch, supo_pad_size = pad_supo_dummy_trajectories(batch, supo_pad_divisor)
+                            actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                            actor_pad_divisor = math.lcm(ppo_mini_batch_size, actor_dp_size)
+                            batch, supo_pad_size = pad_supo_dummy_trajectories(batch, actor_pad_divisor)
                             if supo_pad_size > 0:
                                 metrics["train/supo/dummy_pad_size"] = supo_pad_size
                         
@@ -1860,6 +1985,9 @@ class RayPPOTrainer:
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    if supo_balance_pad_size > 0:
+                        batch = unpad_supo_dummy_trajectories(batch, supo_balance_pad_size)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
